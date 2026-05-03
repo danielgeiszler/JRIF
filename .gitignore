@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+runs/
+splits/
+splits_psmtag/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.idea/
+.vscode/
+
+# Large data files are kept locally but not committed
+data/*.tsv
+data/*.parquet
+checkpoints/*/*.pt
