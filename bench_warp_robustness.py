@@ -39,6 +39,7 @@ from jrif.model import RTModel
 from jrif.model_timeplex import TimePlexModel
 from jrif.model_xformer import XformerSkipModel
 from jrif.model_xformer_iha import XformerSkipIHAModel
+from jrif.model_xformer_pure import XformerPureModel
 
 
 def build_wide_head_dilated_cnn(vocab, embedding_dim: int = 16):
@@ -223,6 +224,10 @@ def main():
         "xformer_skip_ff1024": lambda v: XformerSkipModel(v, embedding_dim=16,
                                                             d_model=128, nhead=4,
                                                             num_layers=2, dim_feedforward=1024,
+                                                            dropout=0.1),
+        "xformer_pure":        lambda v: XformerPureModel(v, embedding_dim=16,
+                                                            d_model=128, nhead=4,
+                                                            num_layers=2, dim_feedforward=512,
                                                             dropout=0.1),
         "xformer_skip_iha":    lambda v: XformerSkipIHAModel(v, embedding_dim=16,
                                                               d_model=128, nhead=4, num_pseudo=4,
