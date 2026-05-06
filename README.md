@@ -24,23 +24,23 @@ uv sync
 
 ## Training
 
-**Step 1**: train the base model on the DIA-NN library.
+**Step 1**: train the label-free base model on a DIA-NN library.
 
 ```bash
-uv run jrif-train-library \
+uv run jrif-train-label-free \
   --data-path data/DIANNv1p9_JD0507_509_LF_HY.tsv \
-  --checkpoint-dir checkpoints/library \
+  --checkpoint-dir checkpoints/label_free \
   --epochs 150
 ```
 
-Expected val R² around 0.997 after convergence. Produces `checkpoints/library/best.pt`.
+Expected val R² around 0.997 after convergence. Produces `checkpoints/label_free/best.pt`.
 
-**Step 2**: fine-tune on the PSMtag library, starting from the base checkpoint.
+**Step 2**: fine-tune on the PSMtag library, starting from the label-free base checkpoint.
 
 ```bash
 uv run jrif-train-psmtag \
   --data-path data/psmtag_library.tsv \
-  --base-checkpoint checkpoints/library/best.pt \
+  --base-checkpoint checkpoints/label_free/best.pt \
   --checkpoint-dir checkpoints/psmtag \
   --epochs 50
 ```
@@ -58,13 +58,13 @@ uv run jrif-predict \
   --checkpoint checkpoints/psmtag/best.pt
 ```
 
-For libraries **without PSMtag modifications** (standard label-free), use the library checkpoint:
+For libraries **without PSMtag modifications** (standard label-free), use the label-free checkpoint:
 
 ```bash
 uv run jrif-predict \
   --input-tsv my_library.tsv \
   --output-tsv my_library_predRT.tsv \
-  --checkpoint checkpoints/library/best.pt
+  --checkpoint checkpoints/label_free/best.pt
 ```
 
 For libraries **with PSMtag applied** (where the tags are implicit and not written in sequences), add `--add-psmtag` so the script annotates every N-terminus and K with the tag before tokenization:
@@ -77,20 +77,66 @@ uv run jrif-predict \
   --add-psmtag
 ```
 
+## Python API
+
+For programmatic use, hand a pandas or polars DataFrame of `{seq, rt}` to
+`RTPredictor.fit(...)`. New modification tokens encountered in the input are
+detected automatically and the embedding tables grow to match (inheriting from
+the parent residue by default). The trained predictor saves a self-describing
+checkpoint that ships its own vocabulary and RT scale, so it round-trips
+through `from_checkpoint(...).predict(df)` without any external configuration.
+
+```python
+import polars as pl
+from jrif import RTPredictor
+
+train_df = pl.read_csv("my_train.tsv", separator="\t")  # cols: seq, rt
+val_df   = pl.read_csv("my_val.tsv",   separator="\t")
+
+predictor = RTPredictor.from_checkpoint("checkpoints/label_free/best.pt")
+result = predictor.fit(
+    train_df, val_df=val_df,
+    epochs=50, lr=1e-4, batch_size=128,
+    fresh_mods=["S[80]"],   # opt-in: don't inherit physico features from S
+)
+print(result.best_val_r2, result.best_val_mae)
+
+predictor.save("checkpoints/my_finetune/best.pt")
+
+# Later, in another process:
+loaded = RTPredictor.from_checkpoint("checkpoints/my_finetune/best.pt")
+preds = loaded.predict(some_df)   # numpy array of RTs in original units
+```
+
+If you don't pass `val_df`, `fit` holds out a peptide-level slice of `train_df`
+controlled by `val_fraction` (default 0.1). Training metrics are returned as
+a `FitResult`, and TensorBoard logging is opt-in via `log_dir=...`.
+
+## Tests
+
+```bash
+uv sync --extra dev
+uv run pytest
+```
+
 ## Repository layout
 
 ```
 JRIF/
 ├── pyproject.toml
 ├── README.md
+├── CLAUDE.md
 ├── src/jrif/
 │   ├── __init__.py
-│   ├── dataset.py        # Tokenizers, VOCAB, RTDataset, library loaders
-│   ├── model.py          # RTModel (dilated CNN)
-│   ├── muon.py           # Muon optimizer (used for conv weights)
-│   ├── train_library.py  # Train base model on DIA-NN library
-│   ├── train_psmtag.py   # Fine-tune base on PSMtag library
-│   └── predict_library.py  # Predict RT for a library TSV
-├── data/                 # Place training libraries here
-└── checkpoints/          # Trained checkpoints land here
+│   ├── api.py             # RTPredictor — public DataFrame API
+│   ├── dataset.py         # Vocabulary, tokenizers, RTDataset, library loaders
+│   ├── model.py           # RTModel (dilated CNN, runtime-extensible vocab)
+│   ├── muon.py            # Muon optimizer (used for conv weights)
+│   ├── io.py              # TSV format detection + PSMtag annotation helper
+│   ├── train_label_free.py # CLI: train label-free base model on DIA-NN library
+│   ├── train_psmtag.py     # CLI: fine-tune base on PSMtag library
+│   └── predict_library.py  # CLI: predict RT for a library TSV
+├── tests/                 # Tokenizer, vocab-extension, checkpoint, API smoke tests
+├── data/                  # Place training libraries here
+└── checkpoints/           # Trained checkpoints land here
 ```

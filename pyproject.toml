@@ -7,19 +7,27 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "torch>=2.2",
     "pandas>=2.0",
+    "polars>=1.0",
+    "pyarrow>=14",
     "tensorboard>=2.15",
     "scikit-learn>=1.4",
     "matplotlib>=3.8",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-jrif-train-library = "jrif.train_library:main"
-jrif-train-psmtag  = "jrif.train_psmtag:main"
-jrif-predict       = "jrif.predict_library:main"
+jrif-train-label-free = "jrif.train_label_free:main"
+jrif-train-psmtag     = "jrif.train_psmtag:main"
+jrif-predict          = "jrif.predict_library:main"
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

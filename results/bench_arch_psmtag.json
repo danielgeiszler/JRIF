@@ -1,0 +1,30 @@
+{
+  "dilated_cnn": {
+    "params": 161997,
+    "pretrain_best_r2": 0.9976593574607899,
+    "pretrain_best_mae": 0.04808545485138893,
+    "pretrain_best_epoch": 93,
+    "pretrain_time_s": 224.51429080963135,
+    "finetune_best_r2": 0.9860192702252906,
+    "finetune_best_mae": 0.06494969129562378,
+    "finetune_best_epoch": 50,
+    "finetune_time_s": 56.5027813911438,
+    "test_r2": 0.9833262207074284,
+    "test_mae": 0.0663655698299408,
+    "test_d95": 0.17209452390670776
+  },
+  "timeplex": {
+    "params": 3548105,
+    "pretrain_best_r2": 0.9974027955111479,
+    "pretrain_best_mae": 0.0491504967212677,
+    "pretrain_best_epoch": 73,
+    "pretrain_time_s": 162.06427431106567,
+    "finetune_best_r2": 0.9847167213891552,
+    "finetune_best_mae": 0.0701853409409523,
+    "finetune_best_epoch": 20,
+    "finetune_time_s": 35.775731563568115,
+    "test_r2": 0.9818615275443624,
+    "test_mae": 0.0716838389635086,
+    "test_d95": 0.19633515179157257
+  }
+}
