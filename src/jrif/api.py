@@ -43,11 +43,34 @@ from jrif.dataset import (
     fit_rt_scale,
     to_polars,
 )
+from jrif.loss import LaplaceUniformMixture
 from jrif.model import RTModel, load_legacy_state_dict
+from jrif.model_xformer import XformerSkipModel
 from jrif.muon import Muon
 
 
 CHECKPOINT_FORMAT_VERSION = 1
+
+
+# Architecture registry: name -> (build_fn(vocab, embedding_dim), arch_label).
+# Only architectures listed here can be saved to / loaded from a checkpoint.
+def _build_dilated_cnn(vocab: Vocabulary, embedding_dim: int) -> nn.Module:
+    return RTModel(vocab, embedding_dim=embedding_dim)
+
+
+def _build_xformer_skip(vocab: Vocabulary, embedding_dim: int) -> nn.Module:
+    return XformerSkipModel(
+        vocab, embedding_dim=embedding_dim,
+        d_model=128, nhead=4, num_layers=2,
+        dim_feedforward=512, dropout=0.1,
+    )
+
+
+_ARCH_BUILDERS = {
+    "dilated_cnn":  _build_dilated_cnn,
+    "xformer_skip": _build_xformer_skip,
+}
+DEFAULT_ARCH = "xformer_skip"
 
 
 DataFrameLike = Union[pl.DataFrame, pd.DataFrame]
@@ -82,7 +105,7 @@ def _split_train_val(
 
 
 def _make_optimizers(
-    model: RTModel, lr: float, weight_decay: float, t_max: int,
+    model: nn.Module, lr: float, weight_decay: float, t_max: int,
 ) -> tuple[list[torch.optim.Optimizer], list]:
     muon_params, adamw_params = [], []
     for name, pr in model.named_parameters():
@@ -106,7 +129,7 @@ def _make_optimizers(
 
 
 def _eval_metrics(
-    model: RTModel, loader: DataLoader, criterion: nn.Module, device: torch.device,
+    model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device,
 ) -> tuple[float, float, float, float]:
     """Returns (loss, mae, r2, delta95) in z-space."""
     model.eval()
@@ -135,15 +158,17 @@ class RTPredictor:
 
     def __init__(
         self,
-        model: RTModel,
+        model: nn.Module,
         rt_median: float = 0.0,
         rt_mad: float = 1.0,
         trained_on: Optional[str] = None,
+        arch: str = DEFAULT_ARCH,
     ):
         self.model = model
         self.rt_median = float(rt_median)
         self.rt_mad = float(rt_mad)
         self.trained_on = trained_on
+        self.arch = arch
 
     @property
     def vocab(self) -> Vocabulary:
@@ -152,8 +177,13 @@ class RTPredictor:
     # ---- constructors ----
 
     @classmethod
-    def from_blank(cls, *, embedding_dim: int = 16) -> "RTPredictor":
-        return cls(model=RTModel(Vocabulary.default(), embedding_dim=embedding_dim))
+    def from_blank(
+        cls, *, embedding_dim: int = 16, arch: str = DEFAULT_ARCH,
+    ) -> "RTPredictor":
+        if arch not in _ARCH_BUILDERS:
+            raise ValueError(f"Unknown arch {arch!r}. Available: {sorted(_ARCH_BUILDERS)}")
+        model = _ARCH_BUILDERS[arch](Vocabulary.default(), embedding_dim)
+        return cls(model=model, arch=arch)
 
     @classmethod
     def from_checkpoint(
@@ -164,23 +194,31 @@ class RTPredictor:
         if isinstance(ckpt, dict) and ckpt.get("format_version") == CHECKPOINT_FORMAT_VERSION:
             vocab = Vocabulary.from_dict(ckpt["vocab"])
             embedding_dim = int(ckpt.get("embedding_dim", 16))
-            model = RTModel(vocab, embedding_dim=embedding_dim)
+            # Default to dilated_cnn for v1 checkpoints written before arch was
+            # tracked, so older saved files still load without a key error.
+            arch = ckpt.get("arch", "dilated_cnn")
+            if arch not in _ARCH_BUILDERS:
+                raise ValueError(f"Checkpoint arch {arch!r} not supported. "
+                                 f"Available: {sorted(_ARCH_BUILDERS)}")
+            model = _ARCH_BUILDERS[arch](vocab, embedding_dim)
             model.load_state_dict(ckpt["model_state_dict"])
             predictor = cls(
                 model=model,
                 rt_median=float(ckpt.get("rt_median", 0.0)),
                 rt_mad=float(ckpt.get("rt_mad", 1.0)),
                 trained_on=ckpt.get("trained_on"),
+                arch=arch,
             )
         else:
-            # Legacy checkpoint: build a default-vocab model and slice oversized
-            # mod embeddings down to fit.
+            # Legacy checkpoint: build a default-vocab dilated CNN and slice
+            # oversized mod embeddings down to fit.
             model = RTModel(Vocabulary.default(), embedding_dim=16)
             state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
             load_legacy_state_dict(model, state)
             rt_med = float(ckpt.get("rt_median", 0.0)) if isinstance(ckpt, dict) else 0.0
             rt_mad = float(ckpt.get("rt_mad", 1.0)) if isinstance(ckpt, dict) else 1.0
-            predictor = cls(model=model, rt_median=rt_med, rt_mad=rt_mad, trained_on="legacy")
+            predictor = cls(model=model, rt_median=rt_med, rt_mad=rt_mad,
+                            trained_on="legacy", arch="dilated_cnn")
         if device is not None:
             predictor.model.to(device)
         return predictor
@@ -192,6 +230,7 @@ class RTPredictor:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "format_version": CHECKPOINT_FORMAT_VERSION,
+            "arch": self.arch,
             "model_state_dict": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             "vocab": self.vocab.to_dict(),
             "embedding_dim": self.model.embedding_dim,
@@ -256,7 +295,22 @@ class RTPredictor:
         patience: Optional[int] = None,
         trained_on: Optional[str] = None,
         verbose: bool = True,
+        loss: str = "mae",
+        selection_metric: str = "mae",
     ) -> FitResult:
+        """Train the wrapped model on a DataFrame.
+
+        loss:
+          "mae"     — nn.L1Loss; recommended for clean / curated libraries.
+          "huber"   — nn.HuberLoss(delta=1.0); kept for backwards compat.
+          "mixture" — LaplaceUniformMixture with learnable b, eps; recommended
+                      for prefiltered-but-noisy data (PSMtag / FragPipe PSMs).
+
+        selection_metric:
+          "mae"     — keep the checkpoint with the lowest val MAE (recommended;
+                      R² is saturated above 0.99 and noisy in the third decimal).
+          "r2"      — legacy: keep the checkpoint with the highest val R².
+        """
         _seed_everything(seed)
         device_t = torch.device(
             device if device else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -318,13 +372,41 @@ class RTPredictor:
         val_loader = DataLoader(val_ds, batch_size=batch_size * 2, shuffle=False)
 
         # 4. Move model to device, build optimizers (after extend_vocab so they
-        # see the resized parameter tensors)
+        # see the resized parameter tensors) and the training criterion.
         self.model.to(device_t)
+
+        if loss == "huber":
+            criterion: nn.Module = nn.HuberLoss(delta=1.0)
+        elif loss == "mae":
+            criterion = nn.L1Loss()
+        elif loss == "mixture":
+            criterion = LaplaceUniformMixture(init_b=1.0, init_eps=0.05, W=10.0)
+        else:
+            raise ValueError(f"Unknown loss {loss!r}; expected huber, mae, mixture")
+        criterion = criterion.to(device_t)
+
         opts, scheds = _make_optimizers(
             self.model, lr=lr, weight_decay=weight_decay,
             t_max=max(1, epochs - warmup_epochs),
         )
-        criterion = nn.HuberLoss(delta=1.0)
+        # Mixture loss carries learnable scalars (b, eps). Fold them into the
+        # AdamW group so they're updated by the optimizer.
+        loss_params = [p for p in criterion.parameters() if p.requires_grad]
+        if loss_params:
+            if opts:
+                opts[0].add_param_group({"params": loss_params})
+            else:
+                opt = torch.optim.AdamW(loss_params, lr=lr, weight_decay=weight_decay)
+                opts.append(opt)
+                scheds.append(torch.optim.lr_scheduler.CosineAnnealingLR(
+                    opt, T_max=max(1, epochs - warmup_epochs),
+                ))
+
+        # Validation metrics always use MAE so val_loss is cross-loss comparable.
+        val_criterion = nn.L1Loss().to(device_t)
+
+        if selection_metric not in ("mae", "r2"):
+            raise ValueError(f"Unknown selection_metric {selection_metric!r}; expected mae or r2")
 
         # Optional TB logging
         writer = None
@@ -366,7 +448,7 @@ class RTPredictor:
                     s.step()
 
             val_loss, val_mae, val_r2, val_d95 = _eval_metrics(
-                self.model, val_loader, criterion, device_t,
+                self.model, val_loader, val_criterion, device_t,
             )
             current_lr = opts[0].param_groups[0]["lr"] if opts else 0.0
             history.append({
@@ -388,7 +470,11 @@ class RTPredictor:
                     f"val_R2 {val_r2:.4f} | val_d95 {val_d95:.4f} | LR {current_lr:.2e}"
                 )
 
-            if val_r2 > best_val_r2:
+            if selection_metric == "mae":
+                improved = val_mae < best_val_mae
+            else:  # "r2"
+                improved = val_r2 > best_val_r2
+            if improved:
                 best_val_r2 = val_r2
                 best_val_mae = val_mae
                 best_epoch = epoch
@@ -398,7 +484,8 @@ class RTPredictor:
                 wait += 1
                 if patience is not None and wait >= patience:
                     if verbose:
-                        print(f"Early stopping at epoch {epoch+1} (no val_R2 improvement for {patience} epochs)")
+                        print(f"Early stopping at epoch {epoch+1} "
+                              f"(no val_{selection_metric.upper()} improvement for {patience} epochs)")
                     break
 
         if writer is not None:

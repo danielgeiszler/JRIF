@@ -25,13 +25,13 @@ drop-in replacement in benches and RTPredictor's training loop.
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Iterable, Optional
 
 import torch
 import torch.nn as nn
 
 from jrif.dataset import Vocabulary, MAX_LEN, CANONICAL_AAS
-from jrif.model import _build_physico_matrix, _build_global_tables
+from jrif.model import _build_physico_matrix, _build_global_tables, _resize_embedding
 
 
 def _sinusoidal_pe(seq_len: int, d_model: int) -> torch.Tensor:
@@ -123,6 +123,71 @@ class XformerSkipModel(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(128, 1),
         )
+
+    def _refresh_lookup_buffers(self) -> None:
+        device = self.physico_features.device
+        self.physico_features = _build_physico_matrix(self.vocab).to(device)
+        h, c, a, hd = _build_global_tables(self.vocab)
+        self.hydro_table = h.to(device)
+        self.charge_table = c.to(device)
+        self.aromatic_table = a.to(device)
+        self.hydrophobic_table = hd.to(device)
+
+    def extend_vocab(
+        self,
+        new_main_tokens: Iterable[tuple[str, Optional[str], bool]] = (),
+        new_nterm_mods: Iterable[str] = (),
+        new_cterm_mods: Iterable[str] = (),
+    ) -> None:
+        """Grow the vocab + every dependent embedding table / lookup buffer
+        in-place. After calling this, any optimizer holding references to the
+        old embedding parameters MUST be rebuilt."""
+        new_main = list(new_main_tokens)
+        new_nterm = list(new_nterm_mods)
+        new_cterm = list(new_cterm_mods)
+        if not new_main and not new_nterm and not new_cterm:
+            return
+
+        device = self.embedding.weight.device
+
+        if new_main:
+            n_new = len(new_main)
+            main_init = torch.zeros(n_new, self.embedding.embedding_dim, device=device)
+            nterm_aa_init = torch.zeros(n_new, self.n_term_embedding.embedding_dim, device=device)
+            cterm_aa_init = torch.zeros(n_new, self.c_term_embedding.embedding_dim, device=device)
+            for k, (_, parent_aa, fresh) in enumerate(new_main):
+                if parent_aa is None or fresh:
+                    continue
+                pid = self.vocab.tokens.get(parent_aa)
+                if pid is None:
+                    continue
+                main_init[k] = self.embedding.weight.data[pid].clone()
+                nterm_aa_init[k] = self.n_term_embedding.weight.data[pid].clone()
+                cterm_aa_init[k] = self.c_term_embedding.weight.data[pid].clone()
+
+            for token, parent_aa, fresh in new_main:
+                self.vocab.extend(token, parent_aa, fresh)
+
+            self.embedding = _resize_embedding(self.embedding, self.vocab.size, main_init, padding_idx=0)
+            self.n_term_embedding = _resize_embedding(self.n_term_embedding, self.vocab.size, nterm_aa_init, padding_idx=0)
+            self.c_term_embedding = _resize_embedding(self.c_term_embedding, self.vocab.size, cterm_aa_init, padding_idx=0)
+            self._refresh_lookup_buffers()
+
+        if new_nterm:
+            init = torch.zeros(len(new_nterm), self.nterm_mod_embedding.embedding_dim, device=device)
+            for mod in new_nterm:
+                self.vocab.extend_nterm_mod(mod)
+            self.nterm_mod_embedding = _resize_embedding(
+                self.nterm_mod_embedding, self.vocab.nterm_size, init,
+            )
+
+        if new_cterm:
+            init = torch.zeros(len(new_cterm), self.cterm_mod_embedding.embedding_dim, device=device)
+            for mod in new_cterm:
+                self.vocab.extend_cterm_mod(mod)
+            self.cterm_mod_embedding = _resize_embedding(
+                self.cterm_mod_embedding, self.vocab.cterm_size, init,
+            )
 
     def forward(
         self,

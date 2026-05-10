@@ -9,7 +9,7 @@ from pathlib import Path
 
 import polars as pl
 
-from jrif.api import RTPredictor
+from jrif.api import RTPredictor, _ARCH_BUILDERS
 from jrif.dataset import load_spectral_library
 
 
@@ -18,6 +18,9 @@ def main():
         description="Train label-free base RT model on a DIA-NN spectral library"
     )
     p.add_argument("--data-path", required=True, help="DIA-NN spectral library TSV")
+    p.add_argument("--arch", default="xformer_skip",
+                   choices=sorted(_ARCH_BUILDERS),
+                   help="Model architecture for the base checkpoint")
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -28,7 +31,12 @@ def main():
     p.add_argument("--log-dir", default="runs/label_free")
     p.add_argument("--checkpoint-dir", default="checkpoints/label_free")
     p.add_argument("--patience", type=int, default=20,
-                   help="Early stop if val R2 hasn't improved for this many epochs")
+                   help="Early stop if val MAE hasn't improved for this many epochs")
+    p.add_argument("--loss", default="mae", choices=["mae", "huber", "mixture"],
+                   help="Training loss. mae is recommended for curated LF data; "
+                        "mixture for prefiltered-but-noisy data.")
+    p.add_argument("--selection-metric", default="mae", choices=["mae", "r2"],
+                   help="Metric used for best-checkpoint selection.")
     p.add_argument("--device", default=None)
     args = p.parse_args()
 
@@ -36,7 +44,8 @@ def main():
     train_df, val_df, test_df = load_spectral_library(args.data_path, seed=args.seed)
     print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
-    predictor = RTPredictor.from_blank()
+    print(f"Architecture: {args.arch}  loss: {args.loss}  selection: val_{args.selection_metric.upper()}")
+    predictor = RTPredictor.from_blank(arch=args.arch)
     result = predictor.fit(
         train_df,
         seq_col="seq", rt_col="rt",
@@ -51,6 +60,8 @@ def main():
         log_dir=args.log_dir,
         patience=args.patience,
         trained_on="label_free",
+        loss=args.loss,
+        selection_metric=args.selection_metric,
     )
     print(f"Best val R2={result.best_val_r2:.4f} MAE={result.best_val_mae:.4f} at epoch {result.best_epoch+1}")
 
