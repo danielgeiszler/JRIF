@@ -24,9 +24,16 @@ ids_df = pd.read_csv("psm_ids_filtered.tsv", sep="\t")
 library_df = pd.read_csv("search_library.tsv", sep="\t")     # cols: seq (rt unused)
 
 # 3. Load the shipped base closest to your data and fine-tune on the IDs.
-p = RTPredictor.from_checkpoint("checkpoints/psmtag/best.pt")
-# - psmtag/best.pt: for searches with PSMtag-style modifications (M[147], C[160], K[308], .[308])
-# - label_free/best.pt: for unmodified or minimally-modified searches
+p = RTPredictor.from_checkpoint("checkpoints/psmtag/dilated_cnn.pt")
+# Pick the (dataset, architecture) that matches your data.
+# Dataset:
+#   - psmtag/: trained on a PSMtag library (M[147], C[160], K[308], .[308] mods).
+#   - label_free/: trained on a clean DIA-NN spectral library (no PSMtag mods).
+# Architecture (per dataset):
+#   - dilated_cnn.pt   ← 162k params; recommended default (faster on CPU, slightly
+#                        better single-model accuracy in our benches).
+#   - xformer_skip.pt  ← 569k params; transformer-on-conv variant. Use if you've
+#                        validated it's better for your specific data.
 
 p.fit(
     ids_df,
@@ -107,20 +114,20 @@ The `--base-checkpoint` arg on `train_psmtag.py` is optional and only used to wa
 uv run jrif-predict \
   --input-tsv my_library.tsv \
   --output-tsv my_library_predRT.tsv \
-  --checkpoint checkpoints/psmtag/best.pt
+  --checkpoint checkpoints/psmtag/dilated_cnn.pt
 
 # label-free libraries
 uv run jrif-predict \
   --input-tsv my_library.tsv \
   --output-tsv my_library_predRT.tsv \
-  --checkpoint checkpoints/label_free/best.pt
+  --checkpoint checkpoints/label_free/dilated_cnn.pt
 
 # When PSMtag is applied but not written into sequences, --add-psmtag annotates
 # every N-terminus and K with the tag before tokenization
 uv run jrif-predict \
   --input-tsv my_psmtag_library.tsv \
   --output-tsv my_psmtag_library_predRT.tsv \
-  --checkpoint checkpoints/psmtag/best.pt \
+  --checkpoint checkpoints/psmtag/dilated_cnn.pt \
   --add-psmtag
 ```
 
@@ -158,7 +165,11 @@ JRIF/
 │   └── predict_library.py  # CLI: predict RT for a library TSV
 ├── tests/                  # Tokenizer, vocab-extension, checkpoint, API smoke tests
 ├── data/                   # Place training libraries here
-└── checkpoints/            # Trained checkpoints land here
-    ├── label_free/best.pt
-    └── psmtag/best.pt
+└── checkpoints/            # Trained checkpoints — one file per (dataset, arch)
+    ├── label_free/
+    │   ├── dilated_cnn.pt   # 162k params, default recommended
+    │   └── xformer_skip.pt  # 569k params, transformer-on-conv variant
+    └── psmtag/
+        ├── dilated_cnn.pt
+        └── xformer_skip.pt
 ```
