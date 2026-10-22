@@ -57,10 +57,22 @@ opt out of inheritance and start at zero (the K[308] precedent).
   returns numbers back in those units.
 
 - **Checkpoints carry their own `format_version`.** `from_checkpoint`
-  branches on this: format-version 1 reads the embedded vocab + RT scale;
-  missing version is treated as legacy and falls back to
+  branches on this: format-versions 1 and 2 read the embedded vocab + RT
+  scale; missing version is treated as legacy and falls back to
   `Vocabulary.default()` plus `load_legacy_state_dict` (slices oversized
   legacy `nterm_mod_embedding` rows). Don't bypass either path.
+
+- **Unified-termini mode (format_version 2).** The preferred representation
+  for new models: `RTPredictor.from_blank(unified_termini=True)` makes
+  terminal mods main-vocab tokens emitted in the sequence (`.[308]` at
+  position 0) with NO terminal head features (head is 133-dim, not 149).
+  Validated to tie the legacy architecture on PSMtag data
+  (`results/bench_termmods_pooling.json`, `inseq_clean` variant). The
+  separate nterm/cterm channels and head injections remain only for loading
+  v1/legacy checkpoints — the shipped checkpoints are all v1 and their
+  training data is not on this machine, so the legacy path must keep
+  working. `unified_termini` is dilated_cnn-only for now (xformer_skip
+  raises).
 
 - **Internal data shape is polars.** `RTDataset` and
   `RTPredictor` accept either pandas or polars at the boundary and convert

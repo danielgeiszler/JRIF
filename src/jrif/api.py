@@ -43,7 +43,7 @@ from jrif.dataset import (
     fit_rt_scale,
     to_polars,
 )
-from jrif.loss import LaplaceUniformMixture
+from jrif.loss import LaplaceUniformMixture, NormalNormalMixture
 from jrif.model import RTModel, load_legacy_state_dict
 from jrif.model_xformer import XformerSkipModel
 from jrif.muon import Muon
@@ -54,11 +54,15 @@ CHECKPOINT_FORMAT_VERSION = 1
 
 # Architecture registry: name -> (build_fn(vocab, embedding_dim), arch_label).
 # Only architectures listed here can be saved to / loaded from a checkpoint.
-def _build_dilated_cnn(vocab: Vocabulary, embedding_dim: int) -> nn.Module:
-    return RTModel(vocab, embedding_dim=embedding_dim)
+def _build_dilated_cnn(vocab: Vocabulary, embedding_dim: int,
+                       unified_termini: bool = False) -> nn.Module:
+    return RTModel(vocab, embedding_dim=embedding_dim, unified_termini=unified_termini)
 
 
-def _build_xformer_skip(vocab: Vocabulary, embedding_dim: int) -> nn.Module:
+def _build_xformer_skip(vocab: Vocabulary, embedding_dim: int,
+                        unified_termini: bool = False) -> nn.Module:
+    if unified_termini:
+        raise ValueError("unified_termini is not yet supported for xformer_skip")
     return XformerSkipModel(
         vocab, embedding_dim=embedding_dim,
         d_model=128, nhead=4, num_layers=2,
@@ -75,6 +79,19 @@ DEFAULT_ARCH = "xformer_skip"
 
 DataFrameLike = Union[pl.DataFrame, pd.DataFrame]
 
+# The settled shipping recipe (bench_transfer_control / bench_termmods_pooling):
+# batch 128 + lr 1e-3 from scratch beat every batch/lr variant tested; mixture
+# loss + val-MAE selection handle PSM label noise. Fine-tunes use lr 1e-4.
+SHIPPING_RECIPE = dict(
+    epochs=150, patience=20, batch_size=128,
+    warmup_epochs=3, weight_decay=1e-4,
+    loss="mixture", selection_metric="mae",
+)
+SCRATCH_LR = 1e-3
+# Fine-tune LR bracketed on reinj FT data (q8/q9): 3e-4 < 1e-3 > 3e-3; the
+# old 1e-4 convention was never measured and loses ~9% MAE. (1 seed, 1 dataset.)
+FINETUNE_LR = 1e-3
+
 
 @dataclass
 class FitResult:
@@ -89,6 +106,16 @@ def _seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
+
+
+def _auto_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def _split_train_val(
@@ -179,10 +206,13 @@ class RTPredictor:
     @classmethod
     def from_blank(
         cls, *, embedding_dim: int = 16, arch: str = DEFAULT_ARCH,
+        unified_termini: bool = False,
     ) -> "RTPredictor":
+        """unified_termini: terminal mods are main-vocab tokens in the
+        sequence (format_version-2 checkpoints); no terminal head features."""
         if arch not in _ARCH_BUILDERS:
             raise ValueError(f"Unknown arch {arch!r}. Available: {sorted(_ARCH_BUILDERS)}")
-        model = _ARCH_BUILDERS[arch](Vocabulary.default(), embedding_dim)
+        model = _ARCH_BUILDERS[arch](Vocabulary.default(), embedding_dim, unified_termini)
         return cls(model=model, arch=arch)
 
     @classmethod
@@ -191,7 +221,7 @@ class RTPredictor:
     ) -> "RTPredictor":
         path = Path(path)
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        if isinstance(ckpt, dict) and ckpt.get("format_version") == CHECKPOINT_FORMAT_VERSION:
+        if isinstance(ckpt, dict) and ckpt.get("format_version") in (1, 2):
             vocab = Vocabulary.from_dict(ckpt["vocab"])
             embedding_dim = int(ckpt.get("embedding_dim", 16))
             # Default to dilated_cnn for v1 checkpoints written before arch was
@@ -200,7 +230,8 @@ class RTPredictor:
             if arch not in _ARCH_BUILDERS:
                 raise ValueError(f"Checkpoint arch {arch!r} not supported. "
                                  f"Available: {sorted(_ARCH_BUILDERS)}")
-            model = _ARCH_BUILDERS[arch](vocab, embedding_dim)
+            unified = bool(ckpt.get("unified_termini", False))
+            model = _ARCH_BUILDERS[arch](vocab, embedding_dim, unified)
             model.load_state_dict(ckpt["model_state_dict"])
             predictor = cls(
                 model=model,
@@ -228,8 +259,10 @@ class RTPredictor:
     def save(self, path: Union[str, Path]) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        unified = bool(getattr(self.model, "unified_termini", False))
         torch.save({
-            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "format_version": 2 if unified else CHECKPOINT_FORMAT_VERSION,
+            "unified_termini": unified,
             "arch": self.arch,
             "model_state_dict": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             "vocab": self.vocab.to_dict(),
@@ -246,11 +279,11 @@ class RTPredictor:
         df: DataFrameLike,
         *,
         seq_col: str = "seq",
-        batch_size: int = 256,
+        batch_size: int = 2048,
         device: Optional[str] = None,
     ) -> np.ndarray:
         device_t = torch.device(
-            device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+            device if device else _auto_device()
         )
         self.model.to(device_t)
         self.model.eval()
@@ -262,11 +295,12 @@ class RTPredictor:
             df_with_rt, self.vocab,
             seq_col=seq_col, rt_col="__rt__",
             rt_median=self.rt_median, rt_mad=self.rt_mad,
+            terminal_in_seq=bool(getattr(self.model, "unified_termini", False)),
         )
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
         preds_z: list[torch.Tensor] = []
-        with torch.no_grad():
+        with torch.inference_mode():
             for seqs, nterm, cterm, _ in loader:
                 z = self.model(seqs.to(device_t), nterm.to(device_t), cterm.to(device_t)).cpu()
                 preds_z.append(z)
@@ -285,12 +319,13 @@ class RTPredictor:
         val_fraction: float = 0.1,
         epochs: int = 50,
         lr: float = 1e-4,
-        batch_size: int = 128,
+        batch_size: Union[int, str] = 128,
         warmup_epochs: int = 3,
         weight_decay: float = 1e-4,
         fresh_mods: Sequence[str] = (),
         seed: int = 42,
         device: Optional[str] = None,
+        num_threads: Optional[int] = None,
         log_dir: Optional[str] = None,
         patience: Optional[int] = None,
         trained_on: Optional[str] = None,
@@ -305,16 +340,50 @@ class RTPredictor:
           "huber"   — nn.HuberLoss(delta=1.0); kept for backwards compat.
           "mixture" — LaplaceUniformMixture with learnable b, eps; recommended
                       for prefiltered-but-noisy data (PSMtag / FragPipe PSMs).
+          "normal_mixture" — NormalNormalMixture (Gaussian bulk + wider
+                      Gaussian outlier component, all scales learned).
 
         selection_metric:
           "mae"     — keep the checkpoint with the lowest val MAE (recommended;
                       R² is saturated above 0.99 and noisy in the third decimal).
           "r2"      — legacy: keep the checkpoint with the highest val R².
+
+        num_threads:
+          CPU only: torch intra-op threads. Defaults to torch's own choice
+          (the performance-core count on Apple Silicon), which benchmarks as
+          optimal — pass a smaller value to leave cores free for other work.
+
+        batch_size:
+          An int, or "auto" to pick a throughput-optimal batch from the
+          compute budget (CPU: min(1024, 128 × threads); GPU: 1024).
+          `epochs` and `patience` are denominated in epochs at the reference
+          batch of 128: when batch_size exceeds it, both are rescaled by
+          (batch / 128) so the total optimizer-STEP budget stays constant —
+          step-matched large batches tie the batch-128 recipe (q5), while a
+          fixed epoch cap silently starves them (q4). lr is NOT rescaled:
+          unscaled lr beat sqrt- and linear-scaled variants at batch 1024.
         """
         _seed_everything(seed)
         device_t = torch.device(
-            device if device else ("cuda" if torch.cuda.is_available() else "cpu")
+            device if device else _auto_device()
         )
+        if num_threads is not None and device_t.type == "cpu":
+            torch.set_num_threads(max(1, num_threads))
+        if batch_size == "auto":
+            if device_t.type == "cpu":
+                batch_size = min(1024, 128 * torch.get_num_threads())
+            else:
+                batch_size = 1024
+            if verbose:
+                print(f"Auto batch size: {batch_size}", flush=True)
+        if batch_size > 128:
+            scale = batch_size / 128
+            epochs = max(1, int(round(epochs * scale)))
+            if patience is not None:
+                patience = max(1, int(round(patience * scale)))
+            if verbose:
+                print(f"Step-budget scaling: epochs={epochs}, patience={patience} "
+                      f"(x{scale:g} for batch {batch_size})", flush=True)
 
         # 1. To polars + minimal column set + drop NaNs
         df_pl = (
@@ -334,11 +403,12 @@ class RTPredictor:
         else:
             train_pl, val_pl = _split_train_val(df_pl, val_fraction=val_fraction, seed=seed)
         if verbose:
-            print(f"Train: {len(train_pl)}, Val: {len(val_pl)}")
+            print(f"Train: {len(train_pl)}, Val: {len(val_pl)}", flush=True)
 
         # 2. Discover unknown tokens against current vocab and extend the model
+        unified = bool(getattr(self.model, "unified_termini", False))
         all_seqs = pl.concat([train_pl, val_pl])["seq"].to_list()
-        new_main, new_nterm = discover_tokens(all_seqs, self.vocab)
+        new_main, new_nterm = discover_tokens(all_seqs, self.vocab, terminal_in_seq=unified)
         fresh_set = set(fresh_mods)
         new_main_triples = [
             (token, parent, token in fresh_set) for token, parent in new_main.items()
@@ -359,12 +429,12 @@ class RTPredictor:
         train_rts = train_pl["rt"].to_numpy().astype("float32")
         rt_med, rt_mad = fit_rt_scale(train_rts)
         if verbose:
-            print(f"  RT scale: median={rt_med:.3f}, MAD={rt_mad:.3f}")
+            print(f"  RT scale: median={rt_med:.3f}, MAD={rt_mad:.3f}", flush=True)
 
         train_ds = RTDataset(train_pl, self.vocab, seq_col="seq", rt_col="rt",
-                             rt_median=rt_med, rt_mad=rt_mad)
+                             rt_median=rt_med, rt_mad=rt_mad, terminal_in_seq=unified)
         val_ds = RTDataset(val_pl, self.vocab, seq_col="seq", rt_col="rt",
-                           rt_median=rt_med, rt_mad=rt_mad)
+                           rt_median=rt_med, rt_mad=rt_mad, terminal_in_seq=unified)
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
             generator=torch.Generator().manual_seed(seed),
@@ -381,8 +451,10 @@ class RTPredictor:
             criterion = nn.L1Loss()
         elif loss == "mixture":
             criterion = LaplaceUniformMixture(init_b=1.0, init_eps=0.05, W=10.0)
+        elif loss == "normal_mixture":
+            criterion = NormalNormalMixture(init_sigma_clean=0.4, init_sigma_ratio=2.0, init_eps=0.05)
         else:
-            raise ValueError(f"Unknown loss {loss!r}; expected huber, mae, mixture")
+            raise ValueError(f"Unknown loss {loss!r}; expected huber, mae, mixture, normal_mixture")
         criterion = criterion.to(device_t)
 
         opts, scheds = _make_optimizers(
@@ -467,7 +539,8 @@ class RTPredictor:
                 print(
                     f"Epoch {epoch+1:3d}/{epochs} | train_loss {train_loss:.4f} | "
                     f"val_loss {val_loss:.4f} | val_MAE {val_mae:.4f} | "
-                    f"val_R2 {val_r2:.4f} | val_d95 {val_d95:.4f} | LR {current_lr:.2e}"
+                    f"val_R2 {val_r2:.4f} | val_d95 {val_d95:.4f} | LR {current_lr:.2e}",
+                    flush=True,
                 )
 
             if selection_metric == "mae":
@@ -485,7 +558,8 @@ class RTPredictor:
                 if patience is not None and wait >= patience:
                     if verbose:
                         print(f"Early stopping at epoch {epoch+1} "
-                              f"(no val_{selection_metric.upper()} improvement for {patience} epochs)")
+                              f"(no val_{selection_metric.upper()} improvement for {patience} epochs)",
+                              flush=True)
                     break
 
         if writer is not None:

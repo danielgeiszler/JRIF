@@ -217,18 +217,31 @@ def _pad(tokens: list[int]) -> list[int]:
     return tokens + [0] * (MAX_LEN - len(tokens))
 
 
-def tokenize(seq: str, vocab: Vocabulary) -> tuple[list[int], int, int]:
+def tokenize(
+    seq: str, vocab: Vocabulary, *, terminal_in_seq: bool = False,
+) -> tuple[list[int], int, int]:
     """Tokenize one peptide sequence with the given Vocabulary.
 
     Returns (token_ids[MAX_LEN], nterm_mod_id, cterm_mod_id). Tokens not in
     `vocab` fall back to the bare AA id when possible, otherwise are dropped.
+
+    terminal_in_seq: unified-termini mode — the N-term mod is emitted as a
+    main-vocab token at position 0 instead of a separate nterm_mod_id, so the
+    sequence tensor is the single place termini are represented.
     """
     if not isinstance(seq, str) or not seq:
         return _pad([]), 0, 0
     body, nterm_mod = _strip_nterm(seq)
-    nterm_id = vocab.nterm_mod_tokens.get(nterm_mod, 0) if nterm_mod else 0
     fmt = _detect_format(seq)
     out: list[int] = []
+    if terminal_in_seq:
+        nterm_id = 0
+        if nterm_mod:
+            idx = vocab.tokens.get(nterm_mod)
+            if idx is not None:
+                out.append(idx)
+    else:
+        nterm_id = vocab.nterm_mod_tokens.get(nterm_mod, 0) if nterm_mod else 0
     for m in _iter_main_matches(body, fmt):
         aa = next((g for g in m.groups() if g), None)
         token = _resolve_main(aa, m.group(0), fmt)
@@ -244,7 +257,7 @@ def tokenize(seq: str, vocab: Vocabulary) -> tuple[list[int], int, int]:
 
 
 def discover_tokens(
-    seqs: Iterable[str], vocab: Vocabulary,
+    seqs: Iterable[str], vocab: Vocabulary, *, terminal_in_seq: bool = False,
 ) -> tuple[dict[str, Optional[str]], set[str]]:
     """Walk sequences and return tokens not yet present in `vocab`.
 
@@ -252,6 +265,9 @@ def discover_tokens(
       (new_main_tokens, new_nterm_mods)
       where new_main_tokens maps each unknown token to its inferred parent AA
       (the bare residue letter for X[NNN]-form tokens; None otherwise).
+
+    terminal_in_seq: unknown N-term mods are reported as main tokens (parent
+    None) rather than as separate nterm mods; new_nterm_mods stays empty.
     """
     new_main: dict[str, Optional[str]] = {}
     new_nterm: set[str] = set()
@@ -259,8 +275,12 @@ def discover_tokens(
         if not isinstance(seq, str) or not seq:
             continue
         body, nterm_mod = _strip_nterm(seq)
-        if nterm_mod and nterm_mod not in vocab.nterm_mod_tokens:
-            new_nterm.add(nterm_mod)
+        if nterm_mod:
+            if terminal_in_seq:
+                if nterm_mod not in vocab.tokens:
+                    new_main[nterm_mod] = None
+            elif nterm_mod not in vocab.nterm_mod_tokens:
+                new_nterm.add(nterm_mod)
         fmt = _detect_format(seq)
         for m in _iter_main_matches(body, fmt):
             aa = next((g for g in m.groups() if g), None)
@@ -301,17 +321,47 @@ def load_spectral_library(
     """DIA-NN library TSV. Group by ModifiedPeptide / PeptideSequence, average
     Tr_recalibrated, split 80/10/10 at the peptide level. Output column names:
     `seq` and `rt`."""
-    df = pl.read_csv(
-        path, separator="\t",
-        columns=["PeptideSequence", "ModifiedPeptide", "Tr_recalibrated"],
-    )
+    header = pl.read_csv(path, separator="\t", n_rows=0).columns
+    mod_col = next((c for c in ("ModifiedPeptide", "ModifiedSequence") if c in header), None)
+    cols = ["PeptideSequence", "Tr_recalibrated"] + ([mod_col] if mod_col else [])
+    df = pl.read_csv(path, separator="\t", columns=cols)
     df = (
         df.drop_nulls("Tr_recalibrated")
-          .with_columns(pl.coalesce("ModifiedPeptide", "PeptideSequence").alias("seq"))
+          .with_columns(
+              (pl.coalesce(mod_col, "PeptideSequence") if mod_col
+               else pl.col("PeptideSequence")).alias("seq"))
           .drop_nulls("seq")
           .filter(pl.col("seq").str.len_chars() > 0)
           .group_by("seq")
           .agg(pl.col("Tr_recalibrated").mean().alias("rt"))
+    )
+    return _peptide_split(df, seed, split_dir)
+
+
+def load_report_lib_parquet(
+    path: str | Path,
+    seed: int = 42,
+    split_dir: str | Path = "splits_psmtag",
+    max_q_value: float = 0.01,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """DIA-NN report-lib.parquet. Drops decoys, filters to Q.Value <=
+    max_q_value, canonicalizes (tag)/(UniMod:n) notation to JRIF psmtag
+    format, averages RT per modified sequence. Output columns: `seq`, `rt`."""
+    df = pl.read_parquet(
+        path, columns=["Modified.Sequence", "RT", "Decoy", "Q.Value"],
+        use_pyarrow=True,
+    )
+    df = (
+        df.filter((pl.col("Decoy") == 0) & (pl.col("Q.Value") <= max_q_value))
+          .group_by("Modified.Sequence").agg(pl.col("RT").mean().alias("rt"))
+          .with_columns(
+              pl.col("Modified.Sequence")
+                .str.replace(r"^\(tag\)", ".[308]")
+                .str.replace_all(r"\(tag\)", "[308]")
+                .str.replace_all(r"\(UniMod:4\)", "[160]")
+                .str.replace_all(r"\(UniMod:35\)", "[147]")
+                .alias("seq"))
+          .select(["seq", "rt"])
     )
     return _peptide_split(df, seed, split_dir)
 
@@ -380,6 +430,7 @@ class RTDataset(Dataset):
         rt_col: Optional[str] = "rt",
         rt_median: Optional[float] = None,
         rt_mad: Optional[float] = None,
+        terminal_in_seq: bool = False,
     ):
         df = to_polars(df)
         seqs = df[seq_col].to_list()
@@ -389,7 +440,7 @@ class RTDataset(Dataset):
         nterm_arr = np.zeros(n, dtype=np.int64)
         cterm_arr = np.zeros(n, dtype=np.int64)
         for i, s in enumerate(seqs):
-            t, ni, ci = tokenize(s, vocab)
+            t, ni, ci = tokenize(s, vocab, terminal_in_seq=terminal_in_seq)
             tok_arr[i, :] = t
             nterm_arr[i] = ni
             cterm_arr[i] = ci
