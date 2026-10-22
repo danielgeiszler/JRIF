@@ -39,7 +39,7 @@ p.fit(
     ids_df,
     seq_col="seq", rt_col="rt",
     epochs=150, patience=20,
-    lr=1e-4,                  # 1e-4 for fine-tune from a pretrained checkpoint
+    lr=1e-3,                  # bracketed optimum for fine-tuning (3e-4 < 1e-3 > 3e-3)
     batch_size=128,
     loss="mixture",           # matches the shipping recipe; handles PSM label noise
     selection_metric="mae",
