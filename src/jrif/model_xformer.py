@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 
 from jrif.dataset import Vocabulary, MAX_LEN, CANONICAL_AAS
-from jrif.model import _build_physico_matrix, _build_global_tables, _resize_embedding
+from jrif.model import _build_physico_matrix, _build_global_tables, _resize_embedding, fast_conv1d, fast_conv_bn1d
 
 
 def _sinusoidal_pe(seq_len: int, d_model: int) -> torch.Tensor:
@@ -59,7 +59,9 @@ class ResDilatedBlock(nn.Module):
                      if in_channels != out_channels else nn.Identity())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.conv(x))) + self.proj(x)
+        if self.training:
+            return self.act(self.bn(fast_conv1d(x, self.conv))) + self.proj(x)
+        return self.act(fast_conv_bn1d(x, self.conv, self.bn)) + self.proj(x)
 
 
 class XformerSkipModel(nn.Module):

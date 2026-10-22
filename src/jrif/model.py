@@ -24,6 +24,7 @@ from typing import Iterable, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from jrif.dataset import Vocabulary, MAX_LEN, CANONICAL_AAS
 
@@ -114,6 +115,54 @@ def _resize_embedding(
     return new_emb
 
 
+def _conv1d_gemm(
+    x: torch.Tensor, w: torch.Tensor, b: Optional[torch.Tensor],
+    d: int, k: int, p: int,
+) -> torch.Tensor:
+    """k-tap dilated 1d conv as a single (C_out, k*C_in) GEMM."""
+    xp = F.pad(x, (p, p)) if p else x
+    L_out = xp.shape[2] - (k - 1) * d
+    # Stack the k shifted views on the channel dim -> one (Cout, k*Cin) GEMM.
+    xcat = torch.cat([xp[:, :, j * d : j * d + L_out] for j in range(k)], dim=1)
+    wf = torch.cat([w[:, :, j] for j in range(k)], dim=1)
+    out = torch.einsum("oc,bcl->bol", wf, xcat)
+    if b is not None:
+        out = out + b.view(1, -1, 1)
+    return out
+
+
+def fast_conv1d(x: torch.Tensor, conv: nn.Conv1d) -> torch.Tensor:
+    """Apply `conv` to x, decomposing into a single GEMM on CPU.
+
+    PyTorch's CPU dispatch sends dilated (and some plain) Conv1d shapes to a
+    naive `slow_conv_dilated2d` fallback with no fast kernel — profiled at
+    ~68% of total train time. A k-tap conv is exactly the sum of k shifted
+    (C_out, C_in) matmuls, fused here into one BLAS GEMM. GPU backends have
+    proper conv kernels, so they keep the native path.
+    """
+    if x.device.type != "cpu":
+        return conv(x)
+    return _conv1d_gemm(
+        x, conv.weight, conv.bias,
+        conv.dilation[0], conv.kernel_size[0], conv.padding[0],
+    )
+
+
+def fast_conv_bn1d(x: torch.Tensor, conv: nn.Conv1d, bn: nn.BatchNorm1d) -> torch.Tensor:
+    """conv + BatchNorm1d with BN folded into the conv weights.
+
+    Exact at eval time (BN uses frozen running stats, an affine transform that
+    commutes into the conv). Callers must only use this when NOT training.
+    """
+    scale = bn.weight / torch.sqrt(bn.running_var + bn.eps)
+    w = conv.weight * scale.view(-1, 1, 1)
+    b0 = conv.bias if conv.bias is not None else torch.zeros_like(bn.running_mean)
+    b = bn.bias + (b0 - bn.running_mean) * scale
+    if x.device.type != "cpu":
+        return F.conv1d(x, w, b, padding=conv.padding[0], dilation=conv.dilation[0])
+    return _conv1d_gemm(x, w, b, conv.dilation[0], conv.kernel_size[0], conv.padding[0])
+
+
 class DilatedBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int, dilation: int):
         super().__init__()
@@ -123,25 +172,30 @@ class DilatedBlock(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.act(self.bn(self.conv(x)))
+        if self.training:
+            return self.act(self.bn(fast_conv1d(x, self.conv)))
+        return self.act(fast_conv_bn1d(x, self.conv, self.bn))
 
 
 class RTModel(nn.Module):
     """Dilated-CNN retention-time model. Sized from a Vocabulary; grow at
     runtime via `extend_vocab`."""
 
-    def __init__(self, vocab: Vocabulary, embedding_dim: int = 16):
+    def __init__(self, vocab: Vocabulary, embedding_dim: int = 16,
+                 unified_termini: bool = False):
         super().__init__()
         self.vocab = vocab
         self.embedding_dim = embedding_dim
+        self.unified_termini = unified_termini
 
         self._register_lookup_buffers(vocab)
 
         self.embedding = nn.Embedding(vocab.size, embedding_dim, padding_idx=0)
-        self.n_term_embedding = nn.Embedding(vocab.size, 4, padding_idx=0)
-        self.c_term_embedding = nn.Embedding(vocab.size, 4, padding_idx=0)
-        self.nterm_mod_embedding = nn.Embedding(max(vocab.nterm_size, 1), 4)
-        self.cterm_mod_embedding = nn.Embedding(max(vocab.cterm_size, 1), 4)
+        if not unified_termini:
+            self.n_term_embedding = nn.Embedding(vocab.size, 4, padding_idx=0)
+            self.c_term_embedding = nn.Embedding(vocab.size, 4, padding_idx=0)
+            self.nterm_mod_embedding = nn.Embedding(max(vocab.nterm_size, 1), 4)
+            self.cterm_mod_embedding = nn.Embedding(max(vocab.cterm_size, 1), 4)
 
         conv_in = 12 + embedding_dim
         self.convs = nn.Sequential(
@@ -152,7 +206,10 @@ class RTModel(nn.Module):
             DilatedBlock(128, 128, kernel_size=3, dilation=16),
         )
 
-        head_in = 128 + 4 + 4 + 4 + 4 + 3 + 1 + 1   # = 149
+        # Unified-termini models carry termini only in the token sequence, so
+        # the head sees just pooled conv channels + the 5 global features.
+        head_in = (128 + 3 + 1 + 1) if unified_termini \
+            else (128 + 4 + 4 + 4 + 4 + 3 + 1 + 1)   # 133 / 149
         self.head = nn.Sequential(
             nn.Dropout(0.3),
             nn.Linear(head_in, 128),
@@ -205,11 +262,18 @@ class RTModel(nn.Module):
         device = self.embedding.weight.device
 
         # Precompute init rows for main / terminal embeddings using the OLD vocab.
+        if (new_nterm or new_cterm) and self.unified_termini:
+            raise ValueError(
+                "unified-termini model: terminal mods are main-vocab tokens; "
+                "pass them via new_main_tokens"
+            )
+
         if new_main:
             n_new = len(new_main)
             main_init = torch.zeros(n_new, self.embedding.embedding_dim, device=device)
-            nterm_aa_init = torch.zeros(n_new, self.n_term_embedding.embedding_dim, device=device)
-            cterm_aa_init = torch.zeros(n_new, self.c_term_embedding.embedding_dim, device=device)
+            if not self.unified_termini:
+                nterm_aa_init = torch.zeros(n_new, self.n_term_embedding.embedding_dim, device=device)
+                cterm_aa_init = torch.zeros(n_new, self.c_term_embedding.embedding_dim, device=device)
             for k, (_, parent_aa, fresh) in enumerate(new_main):
                 if parent_aa is None or fresh:
                     continue
@@ -217,15 +281,17 @@ class RTModel(nn.Module):
                 if pid is None:
                     continue
                 main_init[k] = self.embedding.weight.data[pid].clone()
-                nterm_aa_init[k] = self.n_term_embedding.weight.data[pid].clone()
-                cterm_aa_init[k] = self.c_term_embedding.weight.data[pid].clone()
+                if not self.unified_termini:
+                    nterm_aa_init[k] = self.n_term_embedding.weight.data[pid].clone()
+                    cterm_aa_init[k] = self.c_term_embedding.weight.data[pid].clone()
 
             for token, parent_aa, fresh in new_main:
                 self.vocab.extend(token, parent_aa, fresh)
 
             self.embedding = _resize_embedding(self.embedding, self.vocab.size, main_init, padding_idx=0)
-            self.n_term_embedding = _resize_embedding(self.n_term_embedding, self.vocab.size, nterm_aa_init, padding_idx=0)
-            self.c_term_embedding = _resize_embedding(self.c_term_embedding, self.vocab.size, cterm_aa_init, padding_idx=0)
+            if not self.unified_termini:
+                self.n_term_embedding = _resize_embedding(self.n_term_embedding, self.vocab.size, nterm_aa_init, padding_idx=0)
+                self.c_term_embedding = _resize_embedding(self.c_term_embedding, self.vocab.size, cterm_aa_init, padding_idx=0)
             self._refresh_lookup_buffers()
 
         if new_nterm:
@@ -257,19 +323,22 @@ class RTModel(nn.Module):
         mask = (x != 0).unsqueeze(1)
         token_mask = (tokens != 0).float()
 
-        n_term_token = tokens[:, 0]
-        lengths = (x != 0).sum(dim=1)
-        c_term_idx = (lengths - 1).clamp(min=0)
-        c_term_tokens = x.gather(1, c_term_idx.unsqueeze(1)).squeeze(1)
-        n_term_emb = self.n_term_embedding(n_term_token)
-        c_term_emb = self.c_term_embedding(c_term_tokens)
+        if self.unified_termini:
+            n_term_emb = c_term_emb = n_mod = c_mod = None
+        else:
+            n_term_token = tokens[:, 0]
+            lengths = (x != 0).sum(dim=1)
+            c_term_idx = (lengths - 1).clamp(min=0)
+            c_term_tokens = x.gather(1, c_term_idx.unsqueeze(1)).squeeze(1)
+            n_term_emb = self.n_term_embedding(n_term_token)
+            c_term_emb = self.c_term_embedding(c_term_tokens)
 
-        if nterm_mod_id is None:
-            nterm_mod_id = torch.zeros(B, dtype=torch.long, device=tokens.device)
-        if cterm_mod_id is None:
-            cterm_mod_id = torch.zeros(B, dtype=torch.long, device=tokens.device)
-        n_mod = self.nterm_mod_embedding(nterm_mod_id)
-        c_mod = self.cterm_mod_embedding(cterm_mod_id)
+            if nterm_mod_id is None:
+                nterm_mod_id = torch.zeros(B, dtype=torch.long, device=tokens.device)
+            if cterm_mod_id is None:
+                cterm_mod_id = torch.zeros(B, dtype=torch.long, device=tokens.device)
+            n_mod = self.nterm_mod_embedding(nterm_mod_id)
+            c_mod = self.cterm_mod_embedding(cterm_mod_id)
 
         phys = self.physico_features[x]
         emb = self.embedding(x)
@@ -284,11 +353,17 @@ class RTModel(nn.Module):
         frac_hydrophobic = (self.hydrophobic_table[tokens] * token_mask).sum(dim=1, keepdim=True) / seq_lengths
         norm_seq_len = seq_lengths / float(MAX_LEN)
 
-        feats = torch.cat([
-            z, n_term_emb, c_term_emb, n_mod, c_mod,
-            gravy, net_charge, frac_aromatic,
-            norm_seq_len, frac_hydrophobic,
-        ], dim=1)
+        if self.unified_termini:
+            feats = torch.cat([
+                z, gravy, net_charge, frac_aromatic,
+                norm_seq_len, frac_hydrophobic,
+            ], dim=1)
+        else:
+            feats = torch.cat([
+                z, n_term_emb, c_term_emb, n_mod, c_mod,
+                gravy, net_charge, frac_aromatic,
+                norm_seq_len, frac_hydrophobic,
+            ], dim=1)
         return self.head(feats).squeeze(1)
 
 
