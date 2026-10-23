@@ -1,4 +1,4 @@
-"""Library-TSV I/O helpers: format detection (PSMtag vs DIA-NN) and
+"""Library-TSV I/O helpers: format detection (PSMtag vs spectral-library) and
 PSMtag annotation for libraries where the tag is implicit."""
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import polars as pl
 # Per-format (peptide_col, rt_col) on the source TSV.
 FORMATS: dict[str, tuple[str, str]] = {
     "psmtag": ("ModifiedPeptideSequence", "NormalizedRetentionTime"),
-    "diann": ("ModifiedPeptide", "Tr_recalibrated"),
+    "speclib": ("ModifiedPeptide", "Tr_recalibrated"),
 }
 
 
@@ -20,11 +20,11 @@ def detect_format(columns) -> str:
     if {"ModifiedPeptideSequence", "NormalizedRetentionTime"}.issubset(cols):
         return "psmtag"
     if {"ModifiedPeptide", "Tr_recalibrated"}.issubset(cols):
-        return "diann"
+        return "speclib"
     raise SystemExit(
         f"Unrecognized library format. Need either "
         f"[ModifiedPeptideSequence, NormalizedRetentionTime] (PSMtag) or "
-        f"[ModifiedPeptide, Tr_recalibrated] (DIA-NN). Got columns: {sorted(cols)}"
+        f"[ModifiedPeptide, Tr_recalibrated] (spectral library). Got columns: {sorted(cols)}"
     )
 
 
@@ -45,7 +45,7 @@ def apply_psmtag(seq: str) -> str:
 
 
 def read_library_tsv(path: str | Path) -> pl.DataFrame:
-    """Read a FragPipe / DIA-NN library TSV with full column set preserved."""
+    """Read a FragPipe / spectral-library TSV with full column set preserved."""
     return pl.read_csv(path, separator="\t", infer_schema_length=1000)
 
 

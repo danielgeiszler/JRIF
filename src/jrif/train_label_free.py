@@ -1,4 +1,4 @@
-"""Train the label-free base RT model on a DIA-NN spectral library.
+"""Train the label-free base RT model on a spectral library.
 
 Thin wrapper around RTPredictor with the shipping recipe baked in
 (see jrif.api.SHIPPING_RECIPE). For custom hyperparameters use the
@@ -28,7 +28,7 @@ def _report_test(predictor: RTPredictor, test_df: pl.DataFrame) -> None:
 def main():
     p = argparse.ArgumentParser(
         description="Train label-free base RT model (shipping recipe)")
-    p.add_argument("--data-path", required=True, help="DIA-NN spectral library TSV")
+    p.add_argument("--data-path", required=True, help="spectral library TSV")
     p.add_argument("--checkpoint-dir", default="checkpoints/label_free")
     p.add_argument("--device", default=None, help="cuda / mps / cpu (default: auto)")
     p.add_argument("--seed", type=int, default=42)

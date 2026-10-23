@@ -2,7 +2,7 @@
 back the same TSV with the RT column replaced by predictions.
 
 Auto-detects PSMtag (ModifiedPeptideSequence / NormalizedRetentionTime) vs
-DIA-NN (ModifiedPeptide / Tr_recalibrated) format. Use --add-psmtag if your
+spectral-library (ModifiedPeptide / Tr_recalibrated) format. Use --add-psmtag if your
 library is implicitly PSMtag-tagged but not annotated in the sequence string.
 """
 

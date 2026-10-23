@@ -101,3 +101,39 @@ def test_unified_fit_predict_checkpoint_roundtrip(tmp_path):
 def test_unified_xformer_raises():
     with pytest.raises(ValueError):
         RTPredictor.from_blank(arch="xformer_skip", unified_termini=True)
+
+
+def test_calibrate_isotonic_and_roundtrip(tmp_path):
+    """Matched-vocabulary small-N -> isotonic mode; warp survives save/load."""
+    rng = np.random.default_rng(0)
+    aas = list("ACDEFGHIKLMNPQRSTVWY")
+    w = dict(zip(aas, rng.normal(0, 3, 20)))  # learnable additive chemistry
+    seqs = ["".join(rng.choice(aas, rng.integers(7, 20))) for _ in range(400)]
+    df = pd.DataFrame({"seq": seqs,
+                       "rt": [50 + sum(w[a] for a in s) for s in seqs]})
+    p = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    p.fit(df, epochs=60, lr=1e-3, device="cpu", verbose=False)
+    # new experiment: nonlinear monotone warp of the same chemistry
+    warped = df.assign(rt=np.exp(df["rt"] / 25.0).clip(upper=1e6))
+    cal = warped.iloc[:300]
+    rep = p.calibrate(cal, device="cpu", verbose=False)
+    assert rep["mode"] == "isotonic"
+    assert rep["holdout_rank"] > 0.95
+    preds = p.predict(warped.iloc[300:], device="cpu")
+    assert preds.min() > 0  # output is in warped units, not z
+    path = tmp_path / "cal.pt"
+    p.save(path)
+    q = RTPredictor.from_checkpoint(path)
+    assert q.rt_warp is not None
+    assert np.allclose(q.predict(warped.iloc[300:], device="cpu"), preds, atol=1e-5)
+
+
+def test_calibrate_falls_back_to_finetune_on_broken_rank():
+    rng = np.random.default_rng(1)
+    aas = list("ACDEFGHIKLMNPQRSTVWY")
+    seqs = ["".join(rng.choice(aas, rng.integers(7, 20))) for _ in range(200)]
+    df = pd.DataFrame({"seq": seqs, "rt": rng.normal(0, 1, 200)})  # random targets
+    p = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    rep = p.calibrate(df, device="cpu", verbose=False, epochs=2)
+    assert rep["mode"] == "finetune"
+    assert p.rt_warp is None

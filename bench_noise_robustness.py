@@ -1,7 +1,7 @@
 """Noise-robustness bench: dilated CNN vs timePlex.
 
 Pipeline:
-  - Pretrain each architecture once on clean LF DIA-NN library.
+  - Pretrain each architecture once on clean LF spectral library.
   - For each noise level sigma in {0, 0.1, 0.25, 0.5, 1.0}, restore the
     pretrain weights and fine-tune on the PSMtag train split with Gaussian
     additive noise of std = sigma * train_MAD added to every RT label.
@@ -114,7 +114,7 @@ def add_gaussian_noise(df: pl.DataFrame, sigma_in_mad: float, train_mad: float, 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--lf-data",     default="data/DIANNv1p9_JD0507_509_LF_HY.tsv")
+    p.add_argument("--lf-data",     default="data/lf_library.tsv")
     p.add_argument("--psmtag-data", default="data/psmtag_library.tsv")
     p.add_argument("--pretrain-epochs", type=int, default=80)
     p.add_argument("--pretrain-lr",     type=float, default=1e-3)
@@ -135,7 +135,7 @@ def main():
     print(f"Device: {device}")
     print(f"Noise sigmas (× train MAD): {sigmas}")
 
-    print("\n[data] LF DIA-NN library...")
+    print("\n[data] LF spectral library...")
     lf_train, lf_val, _ = load_spectral_library(args.lf_data, seed=args.seed)
     print(f"  LF train/val: {len(lf_train)}/{len(lf_val)}")
     print("[data] PSMtag library...")

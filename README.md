@@ -6,7 +6,7 @@ A transformer-on-conv ("xformer_skip") model for peptide retention time (RT) pre
 
 Production flow is:
 
-1. Run your search engine (FragPipe, DIA-NN, etc.) on a new experiment.
+1. Run your search engine (FragPipe etc.) on a new experiment.
 2. Filter PSMs to high confidence (e.g. 1% FDR). You now have a few thousand identified peptides with observed RTs from *your* LC gradient.
 3. Fine-tune a shipped JRIF checkpoint on those identified peptides — this calibrates the predictor to your gradient.
 4. Predict RT for the full spectral library you used to search (millions of peptides, only a small fraction identified). These calibrated predictions are then used by the search engine to improve RT-based filtering or rescoring on the next pass.
@@ -15,7 +15,7 @@ Production flow is:
 import pandas as pd
 from jrif.api import RTPredictor
 
-# 1. Identified peptides from this experiment's PSM table (or DIA-NN report).
+# 1. Identified peptides from this experiment's PSM table (or search-engine report).
 #    Columns: seq (peptide string), rt (observed RT from this run, native units).
 ids_df = pd.read_csv("psm_ids_filtered.tsv", sep="\t")
 
@@ -28,7 +28,7 @@ p = RTPredictor.from_checkpoint("checkpoints/psmtag/dilated_cnn.pt")
 # Pick the (dataset, architecture) that matches your data.
 # Dataset:
 #   - psmtag/: trained on a PSMtag library (M[147], C[160], K[308], .[308] mods).
-#   - label_free/: trained on a clean DIA-NN spectral library (no PSMtag mods).
+#   - label_free/: trained on a clean spectral library (no PSMtag mods).
 # Architecture (per dataset):
 #   - dilated_cnn.pt   ← 162k params; recommended default (faster on CPU, slightly
 #                        better single-model accuracy in our benches).
@@ -92,7 +92,7 @@ uv sync
 Both training scripts default to training from scratch (no LF→PSMtag transfer). Use these only when you have a *large* labeled library (~tens of thousands of peptides) and want to produce a new shipping checkpoint. **For fine-tuning to a specific experiment's gradient, use the Python API in "Quick start" above.**
 
 ```bash
-# label-free base from a DIA-NN spectral library (cols: PeptideSequence, Tr_recalibrated)
+# label-free base from a spectral library (cols: PeptideSequence, Tr_recalibrated)
 uv run jrif-train-label-free \
   --data-path data/my_lf_library.tsv \
   --epochs 150 --patience 20 \

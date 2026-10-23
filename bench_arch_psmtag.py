@@ -1,8 +1,8 @@
 """Apples-to-apples comparison: dilated-CNN (RTModel) vs timePlex on PSMtag.
 
 Pipeline per architecture:
-  1. Pretrain from scratch on the DIA-NN label-free library
-     (data/DIANNv1p9_JD0507_509_LF_HY.tsv).
+  1. Pretrain from scratch on the label-free spectral library
+     (data/lf_library.tsv).
   2. Fine-tune on the PSMtag library (data/psmtag_library.tsv).
   3. Evaluate on the held-out PSMtag test split.
 
@@ -132,7 +132,7 @@ def train_loop(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--lf-data",     default="data/DIANNv1p9_JD0507_509_LF_HY.tsv")
+    p.add_argument("--lf-data",     default="data/lf_library.tsv")
     p.add_argument("--psmtag-data", default="data/psmtag_library.tsv")
     p.add_argument("--pretrain-epochs", type=int, default=100)
     p.add_argument("--pretrain-lr",     type=float, default=1e-3)
@@ -153,7 +153,7 @@ def main():
     print(f"Batch={args.batch_size}, warmup={args.warmup_epochs}, wd={args.weight_decay}, patience={args.patience}, seed={args.seed}")
 
     # Phase 0: load data once
-    print("\n[data] Loading label-free DIA-NN library...")
+    print("\n[data] Loading label-free spectral library...")
     lf_train, lf_val, lf_test = load_spectral_library(args.lf_data, seed=args.seed)
     print(f"  LF train/val/test: {len(lf_train)}/{len(lf_val)}/{len(lf_test)}")
     print("[data] Loading PSMtag library...")
@@ -187,8 +187,8 @@ def main():
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"  Params: {n_params:,}")
 
-        # Phase 1: pretrain on label-free DIA-NN library
-        print(f"\n--- [{arch_name}] Phase 1: pretrain on label-free DIA-NN library ---")
+        # Phase 1: pretrain on label-free spectral library
+        print(f"\n--- [{arch_name}] Phase 1: pretrain on label-free spectral library ---")
         t0 = time.time()
         train_loader, val_loader, _test_loader_lf, _, _ = make_loaders(
             lf_train, lf_val, lf_test, vocab, args.batch_size, args.seed,

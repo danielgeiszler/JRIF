@@ -13,7 +13,7 @@ selection, Muon+AdamW, cosine + warmup). Same peptide-level 80/10/10 split and
 robust-z scale for all variants. Metrics reported in the library's native RT
 units.
 
-Data: DIA-NN report-lib parquet with (tag) / (UniMod:n) notation; converted to
+Data: report-library parquet with (tag) / (UniMod:n) notation; converted to
 JRIF psmtag format: leading "(tag)" -> ".[308]", "K(tag)" -> "K[308]",
 "C(UniMod:4)" -> "C[160]", "M(UniMod:35)" -> "M[147]".
 """

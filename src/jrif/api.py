@@ -196,6 +196,9 @@ class RTPredictor:
         self.rt_mad = float(rt_mad)
         self.trained_on = trained_on
         self.arch = arch
+        # Optional isotonic output warp (set by calibrate()): piecewise-linear
+        # map from raw model output to the calibration data's RT units.
+        self.rt_warp: Optional[tuple[np.ndarray, np.ndarray]] = None
 
     @property
     def vocab(self) -> Vocabulary:
@@ -240,6 +243,10 @@ class RTPredictor:
                 trained_on=ckpt.get("trained_on"),
                 arch=arch,
             )
+            warp = ckpt.get("rt_warp")
+            if warp is not None:
+                predictor.rt_warp = (np.asarray(warp[0], dtype=float),
+                                     np.asarray(warp[1], dtype=float))
         else:
             # Legacy checkpoint: build a default-vocab dilated CNN and slice
             # oversized mod embeddings down to fit.
@@ -269,6 +276,8 @@ class RTPredictor:
             "embedding_dim": self.model.embedding_dim,
             "rt_median": self.rt_median,
             "rt_mad": self.rt_mad,
+            "rt_warp": ([self.rt_warp[0].tolist(), self.rt_warp[1].tolist()]
+                        if self.rt_warp is not None else None),
             "trained_on": self.trained_on,
         }, path)
 
@@ -305,7 +314,94 @@ class RTPredictor:
                 z = self.model(seqs.to(device_t), nterm.to(device_t), cterm.to(device_t)).cpu()
                 preds_z.append(z)
         z = torch.cat(preds_z) if preds_z else torch.empty(0)
-        return (z * self.rt_mad + self.rt_median).numpy()
+        out = (z * self.rt_mad + self.rt_median).numpy()
+        if self.rt_warp is not None:
+            xk, yk = self.rt_warp
+            return np.interp(out, xk, yk)
+        return out
+
+    # ---- calibrate ----
+
+    def calibrate(
+        self,
+        df: DataFrameLike,
+        *,
+        seq_col: str = "seq",
+        rt_col: str = "rt",
+        device: Optional[str] = None,
+        min_rank: float = 0.95,
+        max_isotonic_n: int = 1000,
+        holdout_fraction: float = 0.2,
+        seed: int = 42,
+        verbose: bool = True,
+        **fit_kwargs,
+    ) -> dict:
+        """Adapt this predictor to one experiment's identified peptides,
+        automatically choosing between two measured regimes:
+
+          isotonic  — model is frozen; a monotone piecewise-linear warp maps
+                      raw output to the experiment's RT units. Correct when
+                      the base already orders these peptides well (matched
+                      vocabulary / chemistry) and IDs are scarce: at n=100 it
+                      beats fine-tuning by ~36% (results/q13/q14).
+          finetune  — full fine-tune via fit() (shipping recipe, lr 1e-3).
+                      Required when ordering is broken (unknown tokens on
+                      most peptides — e.g. a fixed mod the base never saw;
+                      rank 0.79 vs 0.99, results/night/regime2_isotonic) or
+                      when IDs are plentiful (crossover ~500-1000).
+
+        Decision is empirical, not heuristic: rank-check the frozen model on
+        a held-out fraction of the user's own IDs. Returns a report dict
+        with the chosen mode and holdout diagnostics.
+        """
+        from scipy.stats import spearmanr
+        from sklearn.isotonic import IsotonicRegression
+
+        df_pl = (
+            to_polars(df)
+              .select([pl.col(seq_col).alias("seq"), pl.col(rt_col).cast(pl.Float64).alias("rt")])
+              .drop_nulls()
+              .filter(pl.col("seq").str.len_chars() > 0)
+              .unique(subset=["seq"])
+        )
+        n = len(df_pl)
+        rng = random.Random(seed)
+        order = list(range(n)); rng.shuffle(order)
+        n_hold = max(10, int(n * holdout_fraction))
+        hold_idx, cal_idx = order[:n_hold], order[n_hold:]
+        hold, cal = df_pl[hold_idx], df_pl[cal_idx]
+
+        self.rt_warp = None  # rank-check the raw model
+        z_hold = self.predict(hold, seq_col="seq", device=device)
+        rank = float(spearmanr(hold["rt"].to_numpy(), z_hold).statistic)
+
+        report = {"n": n, "holdout_rank": rank}
+        if rank >= min_rank and n <= max_isotonic_n:
+            z_cal = self.predict(cal, seq_col="seq", device=device)
+            iso = IsotonicRegression(out_of_bounds="clip").fit(z_cal, cal["rt"].to_numpy())
+            # refit on ALL ids for the final warp
+            z_all = self.predict(df_pl, seq_col="seq", device=device)
+            iso_all = IsotonicRegression(out_of_bounds="clip").fit(z_all, df_pl["rt"].to_numpy())
+            report["holdout_mae"] = float(np.abs(iso.predict(z_hold) - hold["rt"].to_numpy()).mean())
+            self.rt_warp = (np.asarray(iso_all.X_thresholds_, dtype=float),
+                            np.asarray(iso_all.y_thresholds_, dtype=float))
+            report["mode"] = "isotonic"
+            if verbose:
+                print(f"calibrate: isotonic warp on {n} IDs "
+                      f"(holdout rank {rank:.4f}, MAE {report['holdout_mae']:.4f})", flush=True)
+        else:
+            reason = "low holdout rank" if rank < min_rank else f"n={n} > {max_isotonic_n}"
+            if verbose:
+                print(f"calibrate: fine-tuning ({reason}; holdout rank {rank:.4f})", flush=True)
+            fit_kwargs.setdefault("lr", FINETUNE_LR)
+            fit_kwargs.setdefault("verbose", verbose)
+            self.fit(df_pl, seq_col="seq", rt_col="rt", val_df=hold,
+                     device=device, seed=seed,
+                     **{**SHIPPING_RECIPE, **fit_kwargs})
+            pred_hold = self.predict(hold, seq_col="seq", device=device)
+            report["holdout_mae"] = float(np.abs(pred_hold - hold["rt"].to_numpy()).mean())
+            report["mode"] = "finetune"
+        return report
 
     # ---- fit ----
 
@@ -364,6 +460,7 @@ class RTPredictor:
           unscaled lr beat sqrt- and linear-scaled variants at batch 1024.
         """
         _seed_everything(seed)
+        self.rt_warp = None  # stale after any weight update
         device_t = torch.device(
             device if device else _auto_device()
         )

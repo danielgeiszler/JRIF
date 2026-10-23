@@ -1,6 +1,6 @@
 """Train the PSMtag base RT model.
 
-Accepts either a FragPipe PSMtag library TSV or a DIA-NN report-lib.parquet
+Accepts either a FragPipe PSMtag library TSV or a search-engine report-library parquet
 (decoys dropped, Q.Value <= 0.01, (tag)/(UniMod:n) canonicalized). Shipping
 recipe baked in (see jrif.api.SHIPPING_RECIPE); custom hyperparameters go
 through the Python API instead.
@@ -20,7 +20,7 @@ def main():
     p = argparse.ArgumentParser(
         description="Train PSMtag base RT model (shipping recipe)")
     p.add_argument("--data-path", required=True,
-                   help="PSMtag library TSV or DIA-NN report-lib .parquet")
+                   help="PSMtag library TSV or report-library .parquet")
     p.add_argument("--base-checkpoint", default=None,
                    help="Optional: warm-start from an existing checkpoint "
                         "(fine-tune lr). Default: train from scratch.")

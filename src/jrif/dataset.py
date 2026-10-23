@@ -318,7 +318,7 @@ def load_spectral_library(
     seed: int = 42,
     split_dir: str | Path = "splits",
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """DIA-NN library TSV. Group by ModifiedPeptide / PeptideSequence, average
+    """spectral-library TSV. Group by ModifiedPeptide / PeptideSequence, average
     Tr_recalibrated, split 80/10/10 at the peptide level. Output column names:
     `seq` and `rt`."""
     header = pl.read_csv(path, separator="\t", n_rows=0).columns
@@ -344,7 +344,7 @@ def load_report_lib_parquet(
     split_dir: str | Path = "splits_psmtag",
     max_q_value: float = 0.01,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """DIA-NN report-lib.parquet. Drops decoys, filters to Q.Value <=
+    """search-engine report-library parquet. Drops decoys, filters to Q.Value <=
     max_q_value, canonicalizes (tag)/(UniMod:n) notation to JRIF psmtag
     format, averages RT per modified sequence. Output columns: `seq`, `rt`."""
     df = pl.read_parquet(
