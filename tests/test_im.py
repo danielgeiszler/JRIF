@@ -63,3 +63,32 @@ def test_fit_discovers_new_tokens():
     p = IMPredictor.from_blank()
     p.fit(df, epochs=1, device="cpu", verbose=False)
     assert ".[308]" in p.vocab.tokens
+
+
+def test_im_calibrate_warp_path_and_roundtrip(tmp_path):
+    """Learnable targets + monotone warp -> warp mode; warp survives save/load."""
+    df = _df(500, seed=3)
+    p = IMPredictor.from_blank()
+    p.fit(df, epochs=40, device="cpu", verbose=False)
+    warped = df.assign(im=np.exp(df["im"] * 2.0))   # new-instrument monotone warp
+    rep = p.calibrate(warped.iloc[:400], device="cpu", verbose=False, epochs=2)
+    assert rep["mode"] in ("warp", "warp+finetune")
+    assert rep["holdout_rank"] > 0.95
+    preds = p.predict(warped.iloc[400:], device="cpu")
+    assert preds.min() > 0          # output in warped units, not z
+    path = tmp_path / "im_cal.pt"
+    p.save(path)
+    q = IMPredictor.from_checkpoint(path)
+    assert q.im_warp is not None
+    assert np.allclose(q.predict(warped.iloc[400:], device="cpu"), preds, atol=1e-5)
+
+
+def test_im_calibrate_falls_back_on_broken_rank():
+    """Unrankable targets (base has no signal) -> finetune_raw, no warp stored."""
+    rng = np.random.default_rng(7)
+    df = _df(200, seed=7)
+    df["im"] = rng.normal(0, 1, len(df))            # random: rank check must fail
+    p = IMPredictor.from_blank()
+    rep = p.calibrate(df, device="cpu", verbose=False, epochs=2)
+    assert rep["mode"] == "finetune_raw"
+    assert p.im_warp is None

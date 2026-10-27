@@ -122,6 +122,9 @@ class IMPredictor:
         self.model = model
         self.im_median = float(im_median)
         self.im_mad = float(im_mad)
+        # Monotone output warp set by calibrate(): (x_knots, y_knots) mapping
+        # model output -> the calibration experiment's IM units.
+        self.im_warp: Optional[tuple] = None
 
     @property
     def vocab(self) -> Vocabulary:
@@ -142,7 +145,11 @@ class IMPredictor:
         vocab = Vocabulary.from_dict(ckpt["vocab"])
         model = IMModel(vocab, int(ckpt.get("embedding_dim", 16)))
         model.load_state_dict(ckpt["model_state_dict"])
-        return cls(model, ckpt.get("im_median", 0.0), ckpt.get("im_mad", 1.0))
+        pred = cls(model, ckpt.get("im_median", 0.0), ckpt.get("im_mad", 1.0))
+        warp = ckpt.get("im_warp")
+        if warp is not None:
+            pred.im_warp = (np.asarray(warp[0], float), np.asarray(warp[1], float))
+        return pred
 
     def save(self, path: Union[str, Path]) -> None:
         path = Path(path)
@@ -153,6 +160,8 @@ class IMPredictor:
             "vocab": self.vocab.to_dict(),
             "embedding_dim": self.model.embedding_dim,
             "im_median": self.im_median, "im_mad": self.im_mad,
+            "im_warp": ([self.im_warp[0].tolist(), self.im_warp[1].tolist()]
+                        if self.im_warp is not None else None),
         }, path)
 
     def predict(self, df: DataFrameLike, *, seq_col="seq", charge_col="charge",
@@ -167,7 +176,90 @@ class IMPredictor:
             for tok, ch, _ in loader:
                 preds.append(self.model(tok.to(device_t), ch.to(device_t)).cpu())
         z = torch.cat(preds) if preds else torch.empty(0)
-        return (z * self.im_mad + self.im_median).numpy()
+        out = (z * self.im_mad + self.im_median).numpy()
+        if self.im_warp is not None:
+            return np.interp(out, self.im_warp[0], self.im_warp[1])
+        return out
+
+    def calibrate(self, df: DataFrameLike, *, seq_col="seq", charge_col="charge",
+                  im_col="im", device: Optional[str] = None, min_rank: float = 0.95,
+                  holdout_fraction: float = 0.2, seed: int = 42,
+                  verbose: bool = True, **fit_kwargs) -> dict:
+        """Adapt to one experiment's identified peptides (same design as
+        RTPredictor.calibrate): fit the monotone warp against the frozen
+        base, fine-tune on inverse-warped targets, keep warp-only or
+        warp+finetune by holdout MAE; fall back to raw fine-tuning only when
+        the base cannot rank the holdout (Spearman < min_rank). Charge is a
+        model input, so one global warp suffices."""
+        from scipy.stats import spearmanr
+        from sklearn.isotonic import IsotonicRegression
+
+        df_pl = (to_polars(df)
+                 .select([pl.col(seq_col).alias("seq"),
+                          pl.col(charge_col).cast(pl.Float64).alias("charge"),
+                          pl.col(im_col).cast(pl.Float64).alias("im")])
+                 .drop_nulls().unique(subset=["seq", "charge"]))
+        n = len(df_pl)
+        rng = random.Random(seed)
+        order = list(range(n)); rng.shuffle(order)
+        n_hold = max(10, int(n * holdout_fraction))
+        hold, cal = df_pl[order[:n_hold]], df_pl[order[n_hold:]]
+        y_hold = hold["im"].to_numpy()
+
+        self.im_warp = None
+        z_hold = self.predict(hold, device=device)
+        rank = float(spearmanr(y_hold, z_hold).statistic)
+        report = {"n": n, "holdout_rank": rank}
+
+        if rank < min_rank:
+            if verbose:
+                print(f"calibrate: warp unusable (holdout rank {rank:.4f}); "
+                      f"fine-tuning on raw targets", flush=True)
+            fit_kwargs.setdefault("verbose", verbose)
+            self.fit(df_pl, val_df=hold, device=device, seed=seed, **fit_kwargs)
+            report["holdout_mae"] = float(np.abs(
+                self.predict(hold, device=device) - y_hold).mean())
+            report["mode"] = "finetune_raw"
+            return report
+
+        def fit_warp(z, y):
+            iso = IsotonicRegression(out_of_bounds="clip").fit(z, y)
+            return (np.asarray(iso.X_thresholds_, float),
+                    np.asarray(iso.y_thresholds_, float))
+
+        z_cal = self.predict(cal, device=device)
+        xk, yk = fit_warp(z_cal, cal["im"].to_numpy())
+        warp_hold_mae = float(np.abs(np.interp(z_hold, xk, yk) - y_hold).mean())
+
+        keep = np.concatenate([[True], np.diff(yk) > 0])
+        inv_x, inv_y = yk[keep], xk[keep]
+        base_state = copy.deepcopy(self.model.state_dict())
+        fit_kwargs.setdefault("verbose", False)
+        self.fit(cal.with_columns(pl.Series("im", np.interp(
+                     cal["im"].to_numpy(), inv_x, inv_y))),
+                 val_df=hold.with_columns(pl.Series("im", np.interp(
+                     y_hold, inv_x, inv_y))),
+                 device=device, seed=seed, **fit_kwargs)
+        z_cal2 = self.predict(cal, device=device)
+        xk2, yk2 = fit_warp(z_cal2, cal["im"].to_numpy())
+        z_hold2 = self.predict(hold, device=device)
+        ft_hold_mae = float(np.abs(np.interp(z_hold2, xk2, yk2) - y_hold).mean())
+
+        report["warp_only_holdout_mae"] = warp_hold_mae
+        report["warp_finetune_holdout_mae"] = ft_hold_mae
+        if ft_hold_mae <= warp_hold_mae:
+            z_all = self.predict(df_pl, device=device)
+            self.im_warp = fit_warp(z_all, df_pl["im"].to_numpy())
+            report["mode"] = "warp+finetune"; report["holdout_mae"] = ft_hold_mae
+        else:
+            self.model.load_state_dict(base_state)
+            z_all = self.predict(df_pl, device=device)
+            self.im_warp = fit_warp(z_all, df_pl["im"].to_numpy())
+            report["mode"] = "warp"; report["holdout_mae"] = warp_hold_mae
+        if verbose:
+            print(f"calibrate: {report['mode']} (rank {rank:.4f}; warp-only "
+                  f"{warp_hold_mae:.4f} vs warp+ft {ft_hold_mae:.4f})", flush=True)
+        return report
 
     def fit(self, df: DataFrameLike, *, seq_col="seq", charge_col="charge", im_col="im",
             val_df: Optional[DataFrameLike] = None, val_fraction: float = 0.1,
@@ -177,6 +269,7 @@ class IMPredictor:
             weight_decay: float = SHIPPING_RECIPE["weight_decay"],
             seed: int = 42, device: Optional[str] = None, verbose: bool = True) -> FitResult:
         _seed_everything(seed)
+        self.im_warp = None  # stale after any weight update
         device_t = torch.device(device if device else _auto_device())
         df_pl = (to_polars(df)
                  .select([pl.col(seq_col).alias("seq"),
