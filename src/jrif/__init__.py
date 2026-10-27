@@ -1,7 +1,10 @@
-"""JRIF — DataFrame-driven retention-time prediction."""
+"""JRIF: peptide retention-time and ion-mobility prediction.
 
-from jrif.api import FitResult, RTPredictor
-from jrif.dataset import RTDataset, Vocabulary
-from jrif.model import RTModel
+Public API:
+    from jrif import RTPredictor, IMPredictor
+"""
 
-__all__ = ["RTPredictor", "FitResult", "RTModel", "Vocabulary", "RTDataset"]
+from jrif.api import RTPredictor
+from jrif.im import IMPredictor
+
+__all__ = ["RTPredictor", "IMPredictor"]

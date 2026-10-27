@@ -33,7 +33,7 @@ and picks the right strategy empirically:
 
 ```python
 import pandas as pd
-from jrif.api import RTPredictor
+from jrif import RTPredictor
 
 # identified peptides from this experiment (1% FDR), observed RTs in native units
 ids_df = pd.read_csv("psm_ids.tsv", sep="\t")        # cols: seq, rt
@@ -76,11 +76,11 @@ plateau, so feed it every confident ID available.
 ## Ion mobility
 
 ```python
-from jrif.im import IMPredictor
+from jrif import IMPredictor
 
 ids = pd.DataFrame({"seq": [...], "charge": [...], "im": [...]})
 m = IMPredictor.from_checkpoint("checkpoints/im/dilated_cnn_v2.pt")
-m.fit(ids)                                   # fine-tune (lr 1e-3 recipe)
+m.calibrate(ids)                             # same warp-first design as RT
 library["pred_im"] = m.predict(library)      # library needs seq + charge cols
 ```
 
@@ -170,17 +170,20 @@ first (Python API) for native-unit predictions.
 ## Repository layout
 
 ```
-src/jrif/
-├── api.py              # RTPredictor: fit / calibrate / predict / save, SHIPPING_RECIPE
-├── im.py               # IMModel / IMDataset / IMPredictor
-├── model.py            # RTModel, extend_vocab, fast conv paths
-├── dataset.py          # Vocabulary, tokenizers, RTDataset, library loaders
-├── loss.py             # LaplaceUniformMixture (+ alternatives)
-├── muon.py             # Muon optimizer
-├── io.py               # library-TSV format detection, PSMtag annotation
-├── train_label_free.py # CLI: label-free RT base
-├── train_psmtag.py     # CLI: PSMtag RT base
-└── predict_library.py  # CLI: batch prediction
+src/jrif/                # runtime package — everything a consumer needs
+├── __init__.py          # public API: RTPredictor, IMPredictor
+├── api.py               # RTPredictor: fit / calibrate / predict / save, SHIPPING_RECIPE
+├── im.py                # IMModel / IMDataset / IMPredictor
+├── model.py             # RTModel, extend_vocab, fast conv paths
+├── dataset.py           # Vocabulary, tokenizers, RTDataset
+├── loss.py              # LaplaceUniformMixture (+ alternatives)
+├── muon.py              # Muon optimizer
+├── io.py                # library-TSV format detection, PSMtag annotation
+├── predict_library.py   # CLI: batch prediction
+└── training/            # base-model building (internal; never runs on user machines)
+    ├── loaders.py       # spectral-library / PSMtag / report-lib ingestion + splits
+    ├── train_label_free.py
+    └── train_psmtag.py
 tests/                  # tokenizer, vocab-extension, calibrate, IM, checkpoint tests
 checkpoints/            # *.pt (gitignored): shipped v2 bases per property
 data/                   # training libraries (gitignored; no LFS)

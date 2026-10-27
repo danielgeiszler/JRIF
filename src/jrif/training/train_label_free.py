@@ -11,7 +11,7 @@ from pathlib import Path
 import polars as pl
 
 from jrif.api import RTPredictor, SHIPPING_RECIPE, SCRATCH_LR
-from jrif.dataset import load_spectral_library
+from jrif.training.loaders import load_spectral_library
 
 
 def _report_test(predictor: RTPredictor, test_df: pl.DataFrame) -> None:

@@ -10,8 +10,8 @@ import argparse
 from pathlib import Path
 
 from jrif.api import RTPredictor, SHIPPING_RECIPE, SCRATCH_LR, FINETUNE_LR
-from jrif.dataset import load_psmtag_library, load_report_lib_parquet
-from jrif.train_label_free import _report_test
+from jrif.training.loaders import load_psmtag_library, load_report_lib_parquet
+from jrif.training.train_label_free import _report_test
 
 
 def main():
