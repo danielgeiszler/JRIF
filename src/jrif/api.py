@@ -324,6 +324,7 @@ class RTPredictor:
         holdout_fraction: float = 0.2,
         seed: int = 42,
         verbose: bool = True,
+        curriculum: bool = False,
         **fit_kwargs,
     ) -> dict:
         """Adapt this predictor to one experiment's identified peptides.
@@ -338,6 +339,13 @@ class RTPredictor:
         results/night/regime2_isotonic.json) — in which case calibrate()
         falls back to plain fine-tuning on raw targets.
 
+        curriculum=True stages adaptation when the data contains modification
+        tokens the base has never seen: calibrate on vocabulary-complete
+        peptides first, then extend the vocab and continue fine-tuning on the
+        full set. No measured benefit over single-phase on simulated novel
+        mods (single-phase inheritance init already absorbs them); provided
+        as an option for evaluation on real novel-mod experiments.
+
         When the warp holds, fine-tuning runs on inverse-warped targets and
         the warp is re-fitted afterwards; warp-only and warp+fine-tune are
         then compared on the holdout and the better one is kept, so tiny-ID
@@ -347,6 +355,12 @@ class RTPredictor:
         """
         from scipy.stats import spearmanr
         from sklearn.isotonic import IsotonicRegression
+
+        if curriculum:
+            return self._calibrate_curriculum(
+                df, seq_col=seq_col, rt_col=rt_col, device=device,
+                min_rank=min_rank, holdout_fraction=holdout_fraction,
+                seed=seed, verbose=verbose, **fit_kwargs)
 
         df_pl = (
             to_polars(df)
@@ -429,6 +443,74 @@ class RTPredictor:
         if verbose:
             print(f"calibrate: {report['mode']} (holdout rank {rank:.4f}; "
                   f"warp-only {warp_hold_mae:.4f} vs warp+ft {ft_hold_mae:.4f})", flush=True)
+        return report
+
+    def _calibrate_curriculum(self, df, *, seq_col, rt_col, device,
+                              min_rank, holdout_fraction, seed, verbose,
+                              **fit_kwargs) -> dict:
+        """Stage 1: calibrate on vocabulary-complete peptides. Stage 2:
+        extend vocab and continue fine-tuning on the full set through the
+        stage-1 warp; refit the warp. Falls back to single-phase when there
+        are no novel tokens or too few clean peptides."""
+        from sklearn.isotonic import IsotonicRegression
+
+        df_pl = (
+            to_polars(df)
+              .select([pl.col(seq_col).alias("seq"), pl.col(rt_col).cast(pl.Float64).alias("rt")])
+              .drop_nulls()
+              .filter(pl.col("seq").str.len_chars() > 0)
+              .unique(subset=["seq"])
+        )
+        unified = bool(getattr(self.model, "unified_termini", False))
+        new_main, new_nterm = discover_tokens(
+            df_pl["seq"].to_list(), self.vocab, terminal_in_seq=unified)
+        novel = set(new_main) | set(new_nterm)
+        if novel:
+            def has_novel(seq: str) -> bool:
+                return any(t in seq for t in novel)
+            is_novel = df_pl["seq"].map_elements(has_novel, return_dtype=pl.Boolean)
+            clean = df_pl.filter(~is_novel)
+        else:
+            clean = df_pl
+        if not novel or len(clean) < 50:
+            if verbose and novel:
+                print("calibrate(curriculum): too few vocabulary-complete "
+                      "peptides; using single-phase", flush=True)
+            return self.calibrate(df_pl, device=device, min_rank=min_rank,
+                                  holdout_fraction=holdout_fraction, seed=seed,
+                                  verbose=verbose, curriculum=False, **fit_kwargs)
+
+        report = self.calibrate(clean, device=device, min_rank=min_rank,
+                                holdout_fraction=holdout_fraction, seed=seed,
+                                verbose=verbose, curriculum=False, **fit_kwargs)
+        stage1_mode = report["mode"]
+        if self.rt_warp is None:
+            # stage 1 fell back to raw fine-tuning; continue single-phase on all
+            fit_kwargs.setdefault("lr", FINETUNE_LR)
+            fit_kwargs.setdefault("verbose", verbose)
+            self.fit(df_pl, seq_col="seq", rt_col="rt", device=device,
+                     seed=seed, **{**SHIPPING_RECIPE, **fit_kwargs})
+            report.update(mode="curriculum_raw", stage1_mode=stage1_mode)
+            return report
+
+        xk, yk = self.rt_warp
+        keep = np.concatenate([[True], np.diff(yk) > 0])
+        inv_targets = np.interp(df_pl["rt"].to_numpy(), yk[keep], xk[keep])
+        fit_kwargs.setdefault("lr", FINETUNE_LR)
+        fit_kwargs.setdefault("verbose", False)
+        self.fit(df_pl.with_columns(pl.Series("rt", inv_targets)),
+                 seq_col="seq", rt_col="rt", device=device, seed=seed,
+                 **{**SHIPPING_RECIPE, **fit_kwargs})
+        z_all = self.predict(df_pl, seq_col="seq", device=device)
+        iso = IsotonicRegression(out_of_bounds="clip").fit(z_all, df_pl["rt"].to_numpy())
+        self.rt_warp = (np.asarray(iso.X_thresholds_, float),
+                        np.asarray(iso.y_thresholds_, float))
+        report.update(mode="curriculum", stage1_mode=stage1_mode,
+                      n_novel_tokens=len(novel), n=len(df_pl))
+        if verbose:
+            print(f"calibrate(curriculum): stage1={stage1_mode} on "
+                  f"{len(clean)} clean IDs; stage2 on {len(df_pl)} with "
+                  f"{len(novel)} new token(s)", flush=True)
         return report
 
     # ---- fit ----

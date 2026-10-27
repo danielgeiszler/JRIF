@@ -132,3 +132,33 @@ def test_calibrate_falls_back_to_finetune_on_broken_rank():
     rep = p.calibrate(df, device="cpu", verbose=False, epochs=2)
     assert rep["mode"] == "finetune_raw"
     assert p.rt_warp is None
+
+
+def test_calibrate_curriculum_with_novel_tokens(tmp_path):
+    rng = np.random.default_rng(0)
+    aas = list("ACDEFGHIKLMNPQRSTVWY")
+    w = dict(zip(aas, rng.normal(0, 3, 20)))
+    seqs = ["".join(rng.choice(aas, rng.integers(7, 20))) for _ in range(400)]
+    df = pd.DataFrame({"seq": seqs,
+                       "rt": [50 + sum(w[a] for a in s) for s in seqs]})
+    p = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    p.fit(df, epochs=60, lr=1e-3, device="cpu", verbose=False)
+    # new experiment: warped scale, and a novel mod on ~25% of peptides
+    new = df.assign(rt=np.exp(df["rt"] / 25.0).clip(upper=1e6))
+    mod = rng.random(len(new)) < 0.25
+    new.loc[mod, "seq"] = new.loc[mod, "seq"].str.replace("A", "A[42]", n=1)
+    rep = p.calibrate(new, device="cpu", verbose=False, curriculum=True, epochs=2)
+    assert rep["mode"] in ("curriculum", "curriculum_raw")
+    assert "A[42]" in p.vocab.tokens
+    preds = p.predict(new.head(20), device="cpu")
+    assert np.isfinite(preds).all()
+
+
+def test_calibrate_curriculum_no_novel_tokens_falls_through():
+    rng = np.random.default_rng(1)
+    aas = list("ACDEFGHIKLMNPQRSTVWY")
+    seqs = ["".join(rng.choice(aas, rng.integers(7, 20))) for _ in range(150)]
+    df = pd.DataFrame({"seq": seqs, "rt": rng.normal(0, 1, 150)})
+    p = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    rep = p.calibrate(df, device="cpu", verbose=False, curriculum=True, epochs=2)
+    assert rep["mode"] == "finetune_raw"   # unrankable -> single-phase fallback

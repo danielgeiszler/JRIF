@@ -65,6 +65,11 @@ What `calibrate()` does internally:
    label-free base) — it fine-tunes on raw targets instead. This regime
    needs more IDs; prefer the matched base.
 
+**Novel modifications**: unknown mod tokens in the IDs are discovered and
+added to the vocabulary automatically (single-phase). `calibrate(df,
+curriculum=True)` instead stages it — calibrate on vocabulary-complete
+peptides first, then extend the vocabulary and continue on the full set.
+
 Pick the base whose training chemistry matches the data: `psmtag/` for
 PSMtag-tagged libraries (`.[308]`, `K[308]`, `C[160]`, `M[147]`), `label_free/`
 for unmodified/camC libraries.
@@ -72,6 +77,32 @@ for unmodified/camC libraries.
 **Guidance on ID counts** (test MAE as % of gradient span, matched base):
 ~1.6% at 100 IDs, 1.2% at 300, 0.9% at 2k, 0.8% at 20k, 0.65% at 78k — no
 plateau, so feed it every confident ID available.
+
+## Prediction inputs
+
+`predict()` takes a pandas or polars DataFrame and returns a numpy array,
+row-aligned, duplicates allowed.
+
+**Columns.** RT: `seq` (override with `seq_col=`). IM: `seq` + `charge`
+(integer precursor charge; `charge_col=`).
+
+**Sequence grammar.** Plain residues (`ACDEFK...`); modified residues as
+`X[mass]` with integer mass (`M[147]`, `C[160]`, `K[308]`, `S[80]`);
+N-terminal mods as a leading `.[mass]` (`.[308]PEPTIDEK[308]`). UniMod
+notation (`M(UniMod:35)`, `C(UniMod:4)`) is auto-detected and canonicalized.
+In non-UniMod formats a bare `C` is treated as `C[160]` (carbamidomethyl
+assumed). Max 50 tokens; longer sequences are truncated. A modified residue
+not in the vocabulary falls back to its bare parent rather than erroring.
+
+**Units.** A shipped base returns robust-z scores; after `calibrate()`/
+`fit()` on an experiment's IDs, predictions are in that experiment's native
+units (affine scale and isotonic warp composed automatically).
+
+**Performance.** Single process, batch-parallel on the selected device
+(default batch 2048, `batch_size=`); `device=` on every predict/fit/
+calibrate call, auto-resolved `cuda` → `mps` → `cpu` when omitted. Throughput
+~60k peptides/s on Apple GPU, ~29k/s on CPU (multicore BLAS) — a 5M-peptide
+library in ~2-3 minutes. No multi-GPU sharding.
 
 ## Ion mobility
 
