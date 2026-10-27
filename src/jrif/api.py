@@ -23,6 +23,7 @@ Either polars or pandas DataFrames are accepted; everything internal is polars.
 
 from __future__ import annotations
 
+import copy
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -330,29 +331,29 @@ class RTPredictor:
         rt_col: str = "rt",
         device: Optional[str] = None,
         min_rank: float = 0.95,
-        max_isotonic_n: int = 1000,
         holdout_fraction: float = 0.2,
         seed: int = 42,
         verbose: bool = True,
         **fit_kwargs,
     ) -> dict:
-        """Adapt this predictor to one experiment's identified peptides,
-        automatically choosing between two measured regimes:
+        """Adapt this predictor to one experiment's identified peptides.
 
-          isotonic  — model is frozen; a monotone piecewise-linear warp maps
-                      raw output to the experiment's RT units. Correct when
-                      the base already orders these peptides well (matched
-                      vocabulary / chemistry) and IDs are scarce: at n=100 it
-                      beats fine-tuning by ~36% (results/q13/q14).
-          finetune  — full fine-tune via fit() (shipping recipe, lr 1e-3).
-                      Required when ordering is broken (unknown tokens on
-                      most peptides — e.g. a fixed mod the base never saw;
-                      rank 0.79 vs 0.99, results/night/regime2_isotonic) or
-                      when IDs are plentiful (crossover ~500-1000).
+        The monotone (isotonic) output warp is ALWAYS fitted first: it maps
+        the user's observed RTs into the coordinate system the base model
+        already speaks, so any subsequent fine-tuning spends its gradient on
+        chemistry, never on re-learning the gradient shape. The warp is
+        abandoned only when it demonstrably fails — the frozen model cannot
+        rank a held-out fraction of the user's own IDs (e.g. transferring a
+        PSMtag experiment onto an LF base: rank 0.79 vs the healthy 0.99;
+        results/night/regime2_isotonic.json) — in which case calibrate()
+        falls back to plain fine-tuning on raw targets.
 
-        Decision is empirical, not heuristic: rank-check the frozen model on
-        a held-out fraction of the user's own IDs. Returns a report dict
-        with the chosen mode and holdout diagnostics.
+        When the warp holds, fine-tuning runs on inverse-warped targets and
+        the warp is re-fitted afterwards; warp-only and warp+fine-tune are
+        then compared on the holdout and the better one is kept, so tiny-ID
+        experiments (where training overfits) automatically resolve to
+        warp-only. Returns a report dict: mode is one of "warp",
+        "warp+finetune", "finetune_raw".
         """
         from scipy.stats import spearmanr
         from sklearn.isotonic import IsotonicRegression
@@ -368,39 +369,76 @@ class RTPredictor:
         rng = random.Random(seed)
         order = list(range(n)); rng.shuffle(order)
         n_hold = max(10, int(n * holdout_fraction))
-        hold_idx, cal_idx = order[:n_hold], order[n_hold:]
-        hold, cal = df_pl[hold_idx], df_pl[cal_idx]
+        hold, cal = df_pl[order[:n_hold]], df_pl[order[n_hold:]]
+        y_hold = hold["rt"].to_numpy()
 
-        self.rt_warp = None  # rank-check the raw model
+        self.rt_warp = None
         z_hold = self.predict(hold, seq_col="seq", device=device)
-        rank = float(spearmanr(hold["rt"].to_numpy(), z_hold).statistic)
-
+        rank = float(spearmanr(y_hold, z_hold).statistic)
         report = {"n": n, "holdout_rank": rank}
-        if rank >= min_rank and n <= max_isotonic_n:
-            z_cal = self.predict(cal, seq_col="seq", device=device)
-            iso = IsotonicRegression(out_of_bounds="clip").fit(z_cal, cal["rt"].to_numpy())
-            # refit on ALL ids for the final warp
-            z_all = self.predict(df_pl, seq_col="seq", device=device)
-            iso_all = IsotonicRegression(out_of_bounds="clip").fit(z_all, df_pl["rt"].to_numpy())
-            report["holdout_mae"] = float(np.abs(iso.predict(z_hold) - hold["rt"].to_numpy()).mean())
-            self.rt_warp = (np.asarray(iso_all.X_thresholds_, dtype=float),
-                            np.asarray(iso_all.y_thresholds_, dtype=float))
-            report["mode"] = "isotonic"
+
+        if rank < min_rank:
+            # Warp genuinely failed: the base cannot order these peptides, so
+            # no monotone map of its output can help. Plain fine-tune.
             if verbose:
-                print(f"calibrate: isotonic warp on {n} IDs "
-                      f"(holdout rank {rank:.4f}, MAE {report['holdout_mae']:.4f})", flush=True)
-        else:
-            reason = "low holdout rank" if rank < min_rank else f"n={n} > {max_isotonic_n}"
-            if verbose:
-                print(f"calibrate: fine-tuning ({reason}; holdout rank {rank:.4f})", flush=True)
+                print(f"calibrate: warp unusable (holdout rank {rank:.4f} < "
+                      f"{min_rank}); fine-tuning on raw targets", flush=True)
             fit_kwargs.setdefault("lr", FINETUNE_LR)
             fit_kwargs.setdefault("verbose", verbose)
             self.fit(df_pl, seq_col="seq", rt_col="rt", val_df=hold,
-                     device=device, seed=seed,
-                     **{**SHIPPING_RECIPE, **fit_kwargs})
-            pred_hold = self.predict(hold, seq_col="seq", device=device)
-            report["holdout_mae"] = float(np.abs(pred_hold - hold["rt"].to_numpy()).mean())
-            report["mode"] = "finetune"
+                     device=device, seed=seed, **{**SHIPPING_RECIPE, **fit_kwargs})
+            pred = self.predict(hold, seq_col="seq", device=device)
+            report["holdout_mae"] = float(np.abs(pred - y_hold).mean())
+            report["mode"] = "finetune_raw"
+            return report
+
+        def fit_warp(z, y):
+            iso = IsotonicRegression(out_of_bounds="clip").fit(z, y)
+            xk = np.asarray(iso.X_thresholds_, dtype=float)
+            yk = np.asarray(iso.y_thresholds_, dtype=float)
+            return xk, yk
+
+        # 1. warp from calibration split; score warp-only on holdout
+        z_cal = self.predict(cal, seq_col="seq", device=device)
+        xk, yk = fit_warp(z_cal, cal["rt"].to_numpy())
+        warp_hold_mae = float(np.abs(np.interp(z_hold, xk, yk) - y_hold).mean())
+
+        # 2. fine-tune on inverse-warped targets (strictly-increasing knots
+        #    so the pseudo-inverse is well defined across flat segments)
+        keep = np.concatenate([[True], np.diff(yk) > 0])
+        inv_x, inv_y = yk[keep], xk[keep]
+        inv_targets = np.interp(cal["rt"].to_numpy(), inv_x, inv_y)
+        hold_inv = hold.with_columns(pl.Series("rt", np.interp(y_hold, inv_x, inv_y)))
+        base_state = copy.deepcopy(self.model.state_dict())
+        fit_kwargs.setdefault("lr", FINETUNE_LR)
+        fit_kwargs.setdefault("verbose", False)
+        self.fit(cal.with_columns(pl.Series("rt", inv_targets)),
+                 seq_col="seq", rt_col="rt", val_df=hold_inv,
+                 device=device, seed=seed, **{**SHIPPING_RECIPE, **fit_kwargs})
+        # refit warp on the fine-tuned model's own outputs
+        z_cal2 = self.predict(cal, seq_col="seq", device=device)
+        xk2, yk2 = fit_warp(z_cal2, cal["rt"].to_numpy())
+        z_hold2 = self.predict(hold, seq_col="seq", device=device)
+        ft_hold_mae = float(np.abs(np.interp(z_hold2, xk2, yk2) - y_hold).mean())
+
+        report["warp_only_holdout_mae"] = warp_hold_mae
+        report["warp_finetune_holdout_mae"] = ft_hold_mae
+        if ft_hold_mae <= warp_hold_mae:
+            # keep fine-tuned weights; final warp refit on ALL ids
+            z_all = self.predict(df_pl, seq_col="seq", device=device)
+            self.rt_warp = fit_warp(z_all, df_pl["rt"].to_numpy())
+            report["mode"] = "warp+finetune"
+            report["holdout_mae"] = ft_hold_mae
+        else:
+            # training hurt (tiny N): restore base weights, warp-only on ALL ids
+            self.model.load_state_dict(base_state)
+            z_all = self.predict(df_pl, seq_col="seq", device=device)
+            self.rt_warp = fit_warp(z_all, df_pl["rt"].to_numpy())
+            report["mode"] = "warp"
+            report["holdout_mae"] = warp_hold_mae
+        if verbose:
+            print(f"calibrate: {report['mode']} (holdout rank {rank:.4f}; "
+                  f"warp-only {warp_hold_mae:.4f} vs warp+ft {ft_hold_mae:.4f})", flush=True)
         return report
 
     # ---- fit ----

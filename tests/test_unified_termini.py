@@ -116,8 +116,8 @@ def test_calibrate_isotonic_and_roundtrip(tmp_path):
     # new experiment: nonlinear monotone warp of the same chemistry
     warped = df.assign(rt=np.exp(df["rt"] / 25.0).clip(upper=1e6))
     cal = warped.iloc[:300]
-    rep = p.calibrate(cal, device="cpu", verbose=False)
-    assert rep["mode"] == "isotonic"
+    rep = p.calibrate(cal, device="cpu", verbose=False, epochs=2)
+    assert rep["mode"] in ("warp", "warp+finetune")
     assert rep["holdout_rank"] > 0.95
     preds = p.predict(warped.iloc[300:], device="cpu")
     assert preds.min() > 0  # output is in warped units, not z
@@ -135,5 +135,5 @@ def test_calibrate_falls_back_to_finetune_on_broken_rank():
     df = pd.DataFrame({"seq": seqs, "rt": rng.normal(0, 1, 200)})  # random targets
     p = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
     rep = p.calibrate(df, device="cpu", verbose=False, epochs=2)
-    assert rep["mode"] == "finetune"
+    assert rep["mode"] == "finetune_raw"
     assert p.rt_warp is None
