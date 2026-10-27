@@ -1,85 +1,21 @@
-# JRIF — peptide retention time prediction
+# JRIF — peptide retention time & ion mobility prediction
 
-A transformer-on-conv ("xformer_skip") model for peptide retention time (RT) prediction. The shipped pipeline is built for one workflow: **calibrate to your LC system using identified peptides from your own experiment, then predict RT for the full search library** to improve downstream peptide-spectrum matching.
+A compact dilated-CNN library for predicting peptide retention time (RT) and
+ion mobility (IM), designed to be embedded in a search tool. The production
+workflow: **ship a pretrained base per property, calibrate it to each
+experiment using that experiment's identified peptides, then predict the full
+search library.**
 
-## Quick start: production workflow
+Two model families, one backbone (162k parameters, unified-termini dilated
+CNN):
 
-Production flow is:
+| | class | input | shipped checkpoint |
+|---|---|---|---|
+| Retention time | `RTPredictor` | peptide sequence | `checkpoints/{label_free,psmtag}/dilated_cnn_v2.pt` |
+| Ion mobility | `IMPredictor` | sequence + precursor charge | `checkpoints/im/dilated_cnn_v2.pt` |
 
-1. Run your search engine (FragPipe etc.) on a new experiment.
-2. Filter PSMs to high confidence (e.g. 1% FDR). You now have a few thousand identified peptides with observed RTs from *your* LC gradient.
-3. Fine-tune a shipped JRIF checkpoint on those identified peptides — this calibrates the predictor to your gradient.
-4. Predict RT for the full spectral library you used to search (millions of peptides, only a small fraction identified). These calibrated predictions are then used by the search engine to improve RT-based filtering or rescoring on the next pass.
-
-```python
-import pandas as pd
-from jrif.api import RTPredictor
-
-# 1. Identified peptides from this experiment's PSM table (or search-engine report).
-#    Columns: seq (peptide string), rt (observed RT from this run, native units).
-ids_df = pd.read_csv("psm_ids_filtered.tsv", sep="\t")
-
-# 2. The full spectral library you want to predict RTs for — same library you
-#    searched against, including peptides that did NOT get identified.
-library_df = pd.read_csv("search_library.tsv", sep="\t")     # cols: seq (rt unused)
-
-# 3. Load the shipped base closest to your data and fine-tune on the IDs.
-p = RTPredictor.from_checkpoint("checkpoints/psmtag/dilated_cnn.pt")
-# Pick the (dataset, architecture) that matches your data.
-# Dataset:
-#   - psmtag/: trained on a PSMtag library (M[147], C[160], K[308], .[308] mods).
-#   - label_free/: trained on a clean spectral library (no PSMtag mods).
-# Architecture (per dataset):
-#   - dilated_cnn.pt   ← 162k params; recommended default (faster on CPU, slightly
-#                        better single-model accuracy in our benches).
-#   - xformer_skip.pt  ← 569k params; transformer-on-conv variant. Use if you've
-#                        validated it's better for your specific data.
-
-p.fit(
-    ids_df,
-    seq_col="seq", rt_col="rt",
-    epochs=150, patience=20,
-    lr=1e-3,                  # bracketed optimum for fine-tuning (3e-4 < 1e-3 > 3e-3)
-    batch_size=128,
-    loss="mixture",           # matches the shipping recipe; handles PSM label noise
-    selection_metric="mae",
-    seed=42,
-    device="cuda",            # or "cpu"
-)
-
-# 4. Predict RT for the full library; output is in your experiment's RT units.
-library_df["pred_rt"] = p.predict(library_df, seq_col="seq")
-library_df.to_csv("search_library_predRT.tsv", sep="\t", index=False)
-```
-
-The fine-tuned predictor stays calibrated to *that one experiment's* gradient. For a new experiment with a different gradient or LC system, re-load the shipped checkpoint and fine-tune again on the new experiment's IDs.
-
-**What `fit()` does for you, automatically:**
-
-- **Discovers new modifications** in your data. If `train_df` contains tokens the base checkpoint doesn't know (e.g. `S[80]`, `K[400]`), `fit()` extends the vocabulary and grows the model's embedding tables in-place — new rows initialized from the parent residue's row (override per-token with `fresh_mods=[...]` if the mod's chemistry diverges too far).
-- **Adopts your RT scale.** The shipped checkpoints output in robust-z space (`rt_median=0`, `rt_mad=1`). After `fit()`, the predictor's RT scale is set from your train data's median/MAD, so `predict()` returns values in your library's native RT units.
-- **Best-checkpoint selection on val MAE.** Holds out 10% of train as val (or pass `val_df=` explicitly); keeps the epoch with the lowest val MAE; early-stops after `patience` epochs without improvement.
-
-## Architecture
-
-The shipped model is `xformer_skip` (568,845 parameters):
-
-- 5 **dilated Conv1d blocks with residual skip** (dilations 1, 2, 4, 8, 16; kernel 3; channels 28 → 64 → 64 → 128 → 128 → 128; GELU + BatchNorm; 1×1 projection on the skip path when channels change).
-- Residue input per position: 12-dim physicochemical lookup (hydrophobicity, mass, pKa, vdW volume, aromaticity, H-bond donors/acceptors, pI, helix/sheet propensity, is-Lys, is-Arg) + 16-dim learned embedding = 28 channels.
-- **Transformer encoder** on top of the conv stack: prepend a learnable [CLS] token, add sinusoidal positional encoding, 2 `TransformerEncoderLayer`s (d_model=128, 4 heads, dim_feedforward=512, GELU, norm_first=True). CLS output is the pooled sequence representation.
-- FC head concatenates: CLS (128) + N/C-term residue embeddings (4 + 4) + N/C-term mod embeddings (4 + 4) + global features (GRAVY, net charge at pH 2.7, fraction aromatic, normalized seq length, fraction hydrophobic) = 149 dims → Linear(149, 128) → GELU → Dropout(0.2) → Linear(128, 1).
-
-**Default vocabulary** (24 tokens): pad + 20 canonical AAs + `M[147]` (oxM) + `C[160]` (camC) + `K[308]` (K-PSMtag). N-term mod vocab: `""` (id 0) + `.[308]` (id 1). C-term mod vocab: `""` (id 0), in place for future C-term modifications. `fit()` extends these at runtime as needed.
-
-## Training recipe (shipped)
-
-What `train_label_free.py` and `train_psmtag.py` use to produce the shipped checkpoints:
-
-- **Loss**: `LaplaceUniformMixture` — `(1-ε)·Laplace(0, b) + ε·Uniform(-W, W)` with learnable `b` and `ε`. Acts as a soft FDR mask: peptides with large residuals get effectively zero gradient as the posterior assigns them to the uniform contamination tail.
-- **Selection metric**: validation MAE (R² is saturated above 0.997 and noisy in the third decimal).
-- **Optimizer**: Muon on the dilated-conv principal weights (`lr×5`), AdamW on everything else (`lr=1e-3`, `weight_decay=1e-4`).
-- **Schedule**: cosine annealing + 3-epoch linear warmup, batch size 128, max 150 epochs with patience 20.
-- **Targets**: robust z-score (median/MAD on train) during training; shipped checkpoints are flattened to `(0, 1)` so `fit()` adopts the user's scale.
+Shipped checkpoints output robust-z scores (`rt_median=0, rt_mad=1`);
+calibration/fine-tuning adopts the user's units automatically.
 
 ## Setup
 
@@ -87,89 +23,176 @@ What `train_label_free.py` and `train_psmtag.py` use to produce the shipped chec
 uv sync
 ```
 
-## CLI: train from scratch on your own library
+Device selection is automatic everywhere (`cuda` → `mps` → `cpu`); pass
+`device=` to override.
 
-Both training scripts default to training from scratch (no LF→PSMtag transfer). Use these only when you have a *large* labeled library (~tens of thousands of peptides) and want to produce a new shipping checkpoint. **For fine-tuning to a specific experiment's gradient, use the Python API in "Quick start" above.**
+## Calibrating to an experiment (the main user path)
 
-```bash
-# label-free base from a spectral library (cols: PeptideSequence, Tr_recalibrated)
-uv run jrif-train-label-free \
-  --data-path data/my_lf_library.tsv \
-  --epochs 150 --patience 20 \
-  --checkpoint-dir checkpoints/label_free
+`calibrate()` adapts a shipped base to one experiment's identified peptides
+and picks the right strategy empirically:
 
-# PSMtag base from scratch (cols: seq, rt)
-uv run jrif-train-psmtag \
-  --data-path data/my_psmtag_library.tsv \
-  --epochs 150 --patience 20 \
-  --checkpoint-dir checkpoints/psmtag
+```python
+import pandas as pd
+from jrif.api import RTPredictor
+
+# identified peptides from this experiment (1% FDR), observed RTs in native units
+ids_df = pd.read_csv("psm_ids.tsv", sep="\t")        # cols: seq, rt
+
+p = RTPredictor.from_checkpoint("checkpoints/psmtag/dilated_cnn_v2.pt")
+report = p.calibrate(ids_df)                          # seq_col=/rt_col= to rename
+print(report)   # {'mode': 'warp+finetune', 'holdout_rank': 0.99, 'holdout_mae': ...}
+
+# predict the full search library, output in the experiment's native RT units
+library = pd.read_csv("search_library.tsv", sep="\t") # col: seq
+library["pred_rt"] = p.predict(library)
+
+p.save("calibrated_rt.pt")   # the warp is stored in the checkpoint
 ```
 
-The `--base-checkpoint` arg on `train_psmtag.py` is optional and only used to warm-start the new base from a previous shipping checkpoint; it's not for fine-tuning to a new experiment. For arbitrary DataFrames, use `RTPredictor.fit()` (see "Quick start").
+What `calibrate()` does internally:
 
-## CLI: predict on a library TSV
+1. **Rank check.** Holds out 20% of the IDs and checks whether the frozen
+   base can rank them (Spearman ≥ 0.95).
+2. **Warp-first path** (normal case — matched chemistry, new gradient): fits
+   a monotone isotonic warp from model output to observed RT, fine-tunes on
+   *inverse-warped* targets (training happens in the model's own space, so
+   gradients go to chemistry, never to re-learning the gradient shape),
+   refits the warp, and keeps warp-only or warp+finetune — whichever scores
+   better on the holdout. Benchmarks: ~1.2% of gradient span from 300 IDs,
+   ~0.9% from 2,000.
+3. **Fallback** (`finetune_raw`): if the rank check fails — the base has
+   never seen the dominant chemistry (e.g. a fixed-mod experiment on the
+   label-free base) — it fine-tunes on raw targets instead. This regime
+   needs more IDs; prefer the matched base.
 
-```bash
-# Use the psmtag checkpoint for libraries with PSMtag modifications
-uv run jrif-predict \
-  --input-tsv my_library.tsv \
-  --output-tsv my_library_predRT.tsv \
-  --checkpoint checkpoints/psmtag/dilated_cnn.pt
+Pick the base whose training chemistry matches the data: `psmtag/` for
+PSMtag-tagged libraries (`.[308]`, `K[308]`, `C[160]`, `M[147]`), `label_free/`
+for unmodified/camC libraries.
 
-# label-free libraries
-uv run jrif-predict \
-  --input-tsv my_library.tsv \
-  --output-tsv my_library_predRT.tsv \
-  --checkpoint checkpoints/label_free/dilated_cnn.pt
+**Guidance on ID counts** (test MAE as % of gradient span, matched base):
+~1.6% at 100 IDs, 1.2% at 300, 0.9% at 2k, 0.8% at 20k, 0.65% at 78k — no
+plateau, so feed it every confident ID available.
 
-# When PSMtag is applied but not written into sequences, --add-psmtag annotates
-# every N-terminus and K with the tag before tokenization
-uv run jrif-predict \
-  --input-tsv my_psmtag_library.tsv \
-  --output-tsv my_psmtag_library_predRT.tsv \
-  --checkpoint checkpoints/psmtag/dilated_cnn.pt \
-  --add-psmtag
+## Ion mobility
+
+```python
+from jrif.im import IMPredictor
+
+ids = pd.DataFrame({"seq": [...], "charge": [...], "im": [...]})
+m = IMPredictor.from_checkpoint("checkpoints/im/dilated_cnn_v2.pt")
+m.fit(ids)                                   # fine-tune (lr 1e-3 recipe)
+library["pred_im"] = m.predict(library)      # library needs seq + charge cols
 ```
 
-> **Note:** `jrif-predict` outputs RT predictions in the shipped checkpoint's
-> z-space (`rt_median=0`, `rt_mad=1`). To get RT in physical units, fine-tune
-> on your experiment's PSM IDs first via the Python API (see "Quick start"
-> above) — that adjusts the RT scale to your gradient and shifts the output
-> back into native units automatically.
+Charge enters as a per-position input channel — benchmarked against a
+head-level feature and no-charge: the input channel is the only variant that
+fixes higher charge states (z=4 MAE 0.020 vs 0.090). `IMPredictor` has the
+same `fit/predict/save/from_checkpoint` surface as RT; checkpoints are tagged
+`kind: "im"` and the two loaders refuse each other's files.
+
+## Fine-tuning directly (bypassing calibrate)
+
+`fit()` is the raw training entry point; `calibrate()` is preferred for
+experiment adaptation, `fit()` for custom workflows:
+
+```python
+p = RTPredictor.from_checkpoint("checkpoints/psmtag/dilated_cnn_v2.pt")
+p.fit(df, seq_col="seq", rt_col="rt",
+      epochs=150, patience=20, lr=1e-3, batch_size=128,
+      loss="mixture", selection_metric="mae", seed=42)
+```
+
+- **New modifications are discovered automatically**: unknown tokens (e.g.
+  `S[80]`) extend the vocabulary in place, initialized from the parent
+  residue's embedding (pass `fresh_mods=[...]` for chemistry too far from the
+  parent — the PSMtag tag is the precedent).
+- **lr 1e-3 for both scratch and fine-tune** (bracketed optimum: 3e-4 < 1e-3 > 3e-3).
+- **`loss="mixture"`** (Laplace + uniform contamination, learnable scale and
+  outlier weight) is the shipping default — it soft-masks mislabeled PSMs.
+  Confirmed against normal/normal and HL-Gauss alternatives.
+- **`batch_size="auto"`** picks a throughput-optimal batch and rescales the
+  epoch/patience budget to keep total optimizer steps constant (quality is
+  step-budget-bound, not batch-bound). Use for fast iteration; the default
+  128 for shipping-quality runs.
+- Any `fit()` clears a stored calibration warp (the weights moved).
+
+## Training base models from scratch
+
+Use the CLIs when producing new shipping checkpoints from a large library
+(tens of thousands of peptides). The full recipe (mixture loss, val-MAE
+selection, Muon+AdamW, cosine schedule + warmup, batch 128, 150 epochs,
+patience 20) is baked in — see `SHIPPING_RECIPE` in `jrif/api.py`.
+
+```bash
+# label-free RT base from a spectral library TSV
+# (cols: PeptideSequence [, ModifiedPeptide|ModifiedSequence], Tr_recalibrated)
+uv run jrif-train-label-free --data-path data/JD_LF.tsv --device mps
+
+# PSMtag RT base from a library TSV or a search-engine report-library parquet
+# (parquet path drops decoys, filters Q.Value <= 0.01, canonicalizes mods)
+uv run jrif-train-psmtag --data-path data/report-lib.parquet --device mps
+```
+
+Both write `<checkpoint-dir>/dilated_cnn_v2.pt` with the RT scale flattened
+to z (shipping convention). `--base-checkpoint` on `jrif-train-psmtag`
+warm-starts from an existing checkpoint at the fine-tune recipe.
+
+The IM base is trained through the Python API (no CLI yet): build the
+`(seq, charge, im)` frame, `IMPredictor.from_blank().fit(...)`, set
+`im_median, im_mad = 0.0, 1.0`, and `save()`.
+
+## Batch prediction CLI
+
+```bash
+uv run jrif-predict \
+  --input-tsv my_library.tsv --output-tsv my_library_predRT.tsv \
+  --checkpoint checkpoints/psmtag/dilated_cnn_v2.pt \
+  [--add-psmtag]   # annotate N-termini and K with the tag before tokenization
+```
+
+Output is in the checkpoint's units — z-scores for shipped bases; calibrate
+first (Python API) for native-unit predictions.
+
+## Architecture (both properties)
+
+- Tokens: 20 AAs + modified residues (`X[mass]`) + terminal mods as in-sequence
+  tokens (`.[308]` at position 0) — one vocabulary, one place (format_version-2
+  "unified termini" checkpoints). The vocabulary lives in the checkpoint and
+  grows at runtime via `extend_vocab`.
+- Per position: 12 physicochemical features + 16-dim learned embedding
+  (+ charge channel for IM) → 5 dilated conv blocks (dil 1/2/4/8/16, GELU+BN)
+  → masked mean pool → small FC head with global features.
+- Conv forward uses a single-GEMM decomposition on CPU (PyTorch's dilated-conv
+  CPU kernel is pathologically slow) and folds BatchNorm at eval — CPU
+  training ~5x and inference ~11x faster than the naive path.
+- Training: Muon on conv weights (lr×5), AdamW elsewhere; robust-z targets.
+
+## Repository layout
+
+```
+src/jrif/
+├── api.py              # RTPredictor: fit / calibrate / predict / save, SHIPPING_RECIPE
+├── im.py               # IMModel / IMDataset / IMPredictor
+├── model.py            # RTModel, extend_vocab, fast conv paths
+├── dataset.py          # Vocabulary, tokenizers, RTDataset, library loaders
+├── loss.py             # LaplaceUniformMixture (+ alternatives)
+├── muon.py             # Muon optimizer
+├── io.py               # library-TSV format detection, PSMtag annotation
+├── train_label_free.py # CLI: label-free RT base
+├── train_psmtag.py     # CLI: PSMtag RT base
+└── predict_library.py  # CLI: batch prediction
+tests/                  # tokenizer, vocab-extension, calibrate, IM, checkpoint tests
+checkpoints/            # *.pt (gitignored): shipped v2 bases per property
+data/                   # training libraries (gitignored; no LFS)
+```
+
+Benchmark scripts and experiment results were pruned from the working tree
+for production; they are preserved in git history (commit `ee20581` and
+earlier).
 
 ## Tests
 
 ```bash
 uv sync --extra dev
 uv run pytest
-```
-
-## Repository layout
-
-```
-JRIF/
-├── pyproject.toml
-├── README.md
-├── CLAUDE.md
-├── src/jrif/
-│   ├── __init__.py
-│   ├── api.py              # RTPredictor — public DataFrame API
-│   ├── dataset.py          # Vocabulary, tokenizers, RTDataset, library loaders
-│   ├── loss.py             # LaplaceUniformMixture + NormalNormalMixture
-│   ├── model.py            # RTModel (dilated CNN; legacy registry entry)
-│   ├── model_xformer.py    # XformerSkipModel — the shipped architecture
-│   ├── muon.py             # Muon optimizer (used for conv weights)
-│   ├── io.py               # TSV format detection + PSMtag annotation helper
-│   ├── train_label_free.py # CLI: train label-free base from scratch
-│   ├── train_psmtag.py     # CLI: train PSMtag base (from scratch or from base)
-│   └── predict_library.py  # CLI: predict RT for a library TSV
-├── tests/                  # Tokenizer, vocab-extension, checkpoint, API smoke tests
-├── data/                   # Place training libraries here
-└── checkpoints/            # Trained checkpoints — one file per (dataset, arch)
-    ├── label_free/
-    │   ├── dilated_cnn.pt   # 162k params, default recommended
-    │   └── xformer_skip.pt  # 569k params, transformer-on-conv variant
-    └── psmtag/
-        ├── dilated_cnn.pt
-        └── xformer_skip.pt
 ```
