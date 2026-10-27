@@ -98,11 +98,6 @@ def test_unified_fit_predict_checkpoint_roundtrip(tmp_path):
     assert np.allclose(preds, preds2, atol=1e-5)
 
 
-def test_unified_xformer_raises():
-    with pytest.raises(ValueError):
-        RTPredictor.from_blank(arch="xformer_skip", unified_termini=True)
-
-
 def test_calibrate_isotonic_and_roundtrip(tmp_path):
     """Matched-vocabulary small-N -> isotonic mode; warp survives save/load."""
     rng = np.random.default_rng(0)

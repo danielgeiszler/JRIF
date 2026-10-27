@@ -46,7 +46,6 @@ from jrif.dataset import (
 )
 from jrif.loss import LaplaceUniformMixture, NormalNormalMixture
 from jrif.model import RTModel, load_legacy_state_dict
-from jrif.model_xformer import XformerSkipModel
 from jrif.muon import Muon
 
 
@@ -60,22 +59,10 @@ def _build_dilated_cnn(vocab: Vocabulary, embedding_dim: int,
     return RTModel(vocab, embedding_dim=embedding_dim, unified_termini=unified_termini)
 
 
-def _build_xformer_skip(vocab: Vocabulary, embedding_dim: int,
-                        unified_termini: bool = False) -> nn.Module:
-    if unified_termini:
-        raise ValueError("unified_termini is not yet supported for xformer_skip")
-    return XformerSkipModel(
-        vocab, embedding_dim=embedding_dim,
-        d_model=128, nhead=4, num_layers=2,
-        dim_feedforward=512, dropout=0.1,
-    )
-
-
 _ARCH_BUILDERS = {
-    "dilated_cnn":  _build_dilated_cnn,
-    "xformer_skip": _build_xformer_skip,
+    "dilated_cnn": _build_dilated_cnn,
 }
-DEFAULT_ARCH = "xformer_skip"
+DEFAULT_ARCH = "dilated_cnn"
 
 
 DataFrameLike = Union[pl.DataFrame, pd.DataFrame]
