@@ -1,0 +1,26 @@
+{
+  "matched_n300": {
+    "mode": "warp+finetune",
+    "holdout_rank": 0.9889,
+    "test_mae_pct_span": 1.223,
+    "test_spearman": 0.9979
+  },
+  "matched_n2000": {
+    "mode": "warp+finetune",
+    "holdout_rank": 0.9909,
+    "test_mae_pct_span": 1.007,
+    "test_spearman": 0.9984
+  },
+  "matched_n78k": {
+    "mode": "warp+finetune",
+    "holdout_rank": 0.9899,
+    "test_mae_pct_span": 0.629,
+    "test_spearman": 0.9991
+  },
+  "mismatched_lf_n300": {
+    "mode": "finetune_raw",
+    "holdout_rank": 0.7911,
+    "test_mae_pct_span": 3.342,
+    "test_spearman": 0.9833
+  }
+}
