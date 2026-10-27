@@ -37,7 +37,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from jrif.dataset import (
-    MAX_LEN,
     RTDataset,
     Vocabulary,
     discover_tokens,
@@ -211,7 +210,11 @@ class RTPredictor:
         cls, path: Union[str, Path], *, device: Optional[str] = None,
     ) -> "RTPredictor":
         path = Path(path)
-        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        try:
+            ckpt = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception:
+            # legacy pre-format_version checkpoints may contain pickled objects
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
         if isinstance(ckpt, dict) and ckpt.get("format_version") in (1, 2):
             vocab = Vocabulary.from_dict(ckpt["vocab"])
             embedding_dim = int(ckpt.get("embedding_dim", 16))

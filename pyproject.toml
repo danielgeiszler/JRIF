@@ -11,7 +11,7 @@ dependencies = [
     "pyarrow>=14",
     "tensorboard>=2.15",
     "scikit-learn>=1.4",
-    "matplotlib>=3.8",
+    "scipy>=1.11",
 ]
 
 [project.optional-dependencies]
@@ -28,7 +28,3 @@ build-backend = "hatchling.build"
 jrif-train-label-free = "jrif.train_label_free:main"
 jrif-train-psmtag     = "jrif.train_psmtag:main"
 jrif-predict          = "jrif.predict_library:main"
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"

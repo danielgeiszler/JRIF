@@ -25,7 +25,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from jrif.api import (
-    FINETUNE_LR,
     SCRATCH_LR,
     SHIPPING_RECIPE,
     DataFrameLike,
@@ -134,7 +133,10 @@ class IMPredictor:
 
     @classmethod
     def from_checkpoint(cls, path: Union[str, Path]) -> "IMPredictor":
-        ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
+        try:
+            ckpt = torch.load(Path(path), map_location="cpu", weights_only=True)
+        except Exception:
+            ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
         if ckpt.get("kind") != "im":
             raise ValueError(f"{path} is not an IM checkpoint")
         vocab = Vocabulary.from_dict(ckpt["vocab"])

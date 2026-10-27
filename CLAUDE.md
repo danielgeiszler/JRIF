@@ -71,8 +71,8 @@ opt out of inheritance and start at zero (the K[308] precedent).
   separate nterm/cterm channels and head injections remain only for loading
   v1/legacy checkpoints — the shipped checkpoints are all v1 and their
   training data is not on this machine, so the legacy path must keep
-  working. `unified_termini` is dilated_cnn-only for now (xformer_skip
-  raises).
+  working. All current architectures are
+  unified-termini capable.
 
 - **Internal data shape is polars.** `RTDataset` and
   `RTPredictor` accept either pandas or polars at the boundary and convert
@@ -98,9 +98,15 @@ uv run pytest
 
 | File | What it owns |
 |---|---|
-| `api.py` | `RTPredictor`, `FitResult`, the train loop |
+| `api.py` | `RTPredictor` (`fit`/`calibrate`/`predict`/`save`), `SHIPPING_RECIPE`, train loop |
+| `im.py` | `IMModel` / `IMDataset` / `IMPredictor` (charge as input channel) |
 | `dataset.py` | `Vocabulary`, tokenizers, `RTDataset`, library loaders |
-| `model.py` | `RTModel`, `extend_vocab`, `load_legacy_state_dict` |
+| `model.py` | `RTModel`, `extend_vocab`, fast conv paths, `load_legacy_state_dict` |
+| `loss.py` | `LaplaceUniformMixture` (shipping loss) + alternatives |
 | `io.py` | TSV format detection, `apply_psmtag` annotation helper |
 | `muon.py` | Muon optimizer for conv weights |
 | `train_label_free.py` / `train_psmtag.py` / `predict_library.py` | thin CLI wrappers |
+
+Benchmark scripts and experiment results were pruned for production; they
+live in git history at commit `ee20581` and earlier. The architecture
+registry is dilated_cnn-only; the xformer variants were removed with them.
