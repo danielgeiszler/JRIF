@@ -16,3 +16,7 @@ build/
 data/*.tsv
 data/*.parquet
 checkpoints/*/*.pt
+# shipped models are the exception — they are the product
+!checkpoints/label_free/dilated_cnn_v2.pt
+!checkpoints/psmtag/dilated_cnn_v2.pt
+!checkpoints/im/dilated_cnn_v2.pt
