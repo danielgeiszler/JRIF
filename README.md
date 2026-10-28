@@ -1,5 +1,9 @@
 # JRIF — peptide retention time & ion mobility prediction
 
+[![PyPI](https://img.shields.io/pypi/v/jrif.svg)](https://pypi.org/project/jrif/)
+
+Install: `pip install jrif`
+
 A compact dilated-CNN library for predicting peptide retention time (RT) and
 ion mobility (IM), designed to be embedded in a search tool. The production
 workflow: **ship a pretrained base per property, calibrate it to each
