@@ -22,9 +22,9 @@ CNN). Currently supported modalities:
   - **IM** — `IMPredictor`, input: sequence + precursor charge (z 2-4) —
     `checkpoint_path("im_psmtag")`
 
-There is no label-free IM base yet; other chemistries are reachable from the
-nearest base via `calibrate()` (novel mods are added to the vocabulary
-automatically, at some accuracy cost vs a matched base).
+There is no label-free IM base yet; other chemistries can be learned via
+the `calibrate()` API (novel mods are added to the vocabulary
+automatically).
 
 Shipped checkpoints output robust-z scores (`rt_median=0, rt_mad=1`);
 calibration/fine-tuning adopts the user's units automatically.
@@ -64,15 +64,18 @@ p.save("calibrated_rt.pt")   # the warp is stored in the checkpoint
 
 What `calibrate()` does internally:
 
-1. **Rank check.** Holds out 20% of the IDs and checks whether the frozen
-   base can rank them (Spearman ≥ 0.95).
+1. **Split + rank check.** Sets aside 20% of the IDs as a holdout, which is
+   used for every decision calibrate makes (the later warp-vs-fine-tune
+   comparison must be scored on peptides nothing was fitted to). First
+   decision: can the frozen base rank the holdout (Spearman ≥ 0.95)? Rank is
+   the right gate because a monotone warp can rescale predictions but never
+   reorder them — broken ordering means no warp can help.
 2. **Warp-first path** (normal case — matched chemistry, new gradient): fits
    a monotone isotonic warp from model output to observed RT, fine-tunes on
    *inverse-warped* targets (training happens in the model's own space, so
    gradients go to chemistry, never to re-learning the gradient shape),
    refits the warp, and keeps warp-only or warp+finetune — whichever scores
-   better on the holdout. Benchmarks: ~1.2% of gradient span from 300 IDs,
-   ~0.9% from 2,000.
+   better on the holdout.
 3. **Fallback** (`finetune_raw`): if the rank check fails — the base has
    never seen the dominant chemistry (e.g. a fixed-mod experiment on the
    label-free base) — it fine-tunes on raw targets instead. This regime
