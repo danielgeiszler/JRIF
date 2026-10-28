@@ -7,12 +7,20 @@ experiment using that experiment's identified peptides, then predict the full
 search library.**
 
 Two model families, one backbone (162k parameters, unified-termini dilated
-CNN):
+CNN). Currently supported modalities:
 
-| | class | input | shipped checkpoint |
-|---|---|---|---|
-| Retention time | `RTPredictor` | peptide sequence | `checkpoints/{label_free,psmtag}/dilated_cnn_v2.pt` |
-| Ion mobility | `IMPredictor` | sequence + precursor charge | `checkpoints/im/dilated_cnn_v2.pt` |
+- **Label-free** (unmodified / camC chemistry)
+  - **RT** — `RTPredictor`, input: peptide sequence —
+    `checkpoints/label_free/dilated_cnn_v2.pt`
+- **PSMtag** (`.[308]`, `K[308]`, `C[160]`, `M[147]`)
+  - **RT** — `RTPredictor`, input: peptide sequence —
+    `checkpoints/psmtag/dilated_cnn_v2.pt`
+  - **IM** — `IMPredictor`, input: sequence + precursor charge (z 2-4) —
+    `checkpoints/im/dilated_cnn_v2.pt`
+
+There is no label-free IM base yet; other chemistries are reachable from the
+nearest base via `calibrate()` (novel mods are added to the vocabulary
+automatically, at some accuracy cost vs a matched base).
 
 Shipped checkpoints output robust-z scores (`rt_median=0, rt_mad=1`);
 calibration/fine-tuning adopts the user's units automatically.
