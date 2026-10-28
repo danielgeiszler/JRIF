@@ -5,22 +5,22 @@
 Install: `pip install jrif`
 
 A compact dilated-CNN library for predicting peptide retention time (RT) and
-ion mobility (IM), designed to be embedded in a search tool. The production
-workflow: **ship a pretrained base per property, calibrate it to each
+ion mobility (IM). The production
+workflow: **ship a pretrained base per property, fine-tune it to each
 experiment using that experiment's identified peptides, then predict the full
 search library.**
 
 Two model families, one backbone (162k parameters, unified-termini dilated
 CNN). Currently supported modalities:
 
-- **Label-free** (unmodified / camC chemistry)
+- **Label-free**
   - **RT** — `RTPredictor`, input: peptide sequence —
-    `checkpoint_path("label_free")`
-- **PSMtag** (`.[308]`, `K[308]`, `C[160]`, `M[147]`)
+    `checkpoint_path("rt_lf")`
+- **PSMtag**
   - **RT** — `RTPredictor`, input: peptide sequence —
-    `checkpoint_path("psmtag")`
+    `checkpoint_path("rt_psmtag")`
   - **IM** — `IMPredictor`, input: sequence + precursor charge (z 2-4) —
-    `checkpoint_path("im")`
+    `checkpoint_path("im_psmtag")`
 
 There is no label-free IM base yet; other chemistries are reachable from the
 nearest base via `calibrate()` (novel mods are added to the vocabulary
@@ -51,7 +51,7 @@ from jrif import RTPredictor
 ids_df = pd.read_csv("psm_ids.tsv", sep="\t")        # cols: seq, rt
 
 from jrif.checkpoints import checkpoint_path
-p = RTPredictor.from_checkpoint(checkpoint_path("psmtag"))
+p = RTPredictor.from_checkpoint(checkpoint_path("rt_psmtag"))
 report = p.calibrate(ids_df)                          # seq_col=/rt_col= to rename
 print(report)   # {'mode': 'warp+finetune', 'holdout_rank': 0.99, 'holdout_mae': ...}
 
@@ -123,7 +123,7 @@ library in ~2-3 minutes. No multi-GPU sharding.
 from jrif import IMPredictor
 
 ids = pd.DataFrame({"seq": [...], "charge": [...], "im": [...]})
-m = IMPredictor.from_checkpoint(checkpoint_path("im"))
+m = IMPredictor.from_checkpoint(checkpoint_path("im_psmtag"))
 m.calibrate(ids)                             # same warp-first design as RT
 library["pred_im"] = m.predict(library)      # library needs seq + charge cols
 ```
@@ -140,7 +140,7 @@ same `fit/predict/save/from_checkpoint` surface as RT; checkpoints are tagged
 experiment adaptation, `fit()` for custom workflows:
 
 ```python
-p = RTPredictor.from_checkpoint(checkpoint_path("psmtag"))
+p = RTPredictor.from_checkpoint(checkpoint_path("rt_psmtag"))
 p.fit(df, seq_col="seq", rt_col="rt",
       epochs=150, patience=20, lr=1e-3, batch_size=128,
       loss="mixture", selection_metric="mae", seed=42)
