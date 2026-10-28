@@ -11,12 +11,12 @@ CNN). Currently supported modalities:
 
 - **Label-free** (unmodified / camC chemistry)
   - **RT** — `RTPredictor`, input: peptide sequence —
-    `checkpoints/label_free/dilated_cnn_v2.pt`
+    `checkpoint_path("label_free")`
 - **PSMtag** (`.[308]`, `K[308]`, `C[160]`, `M[147]`)
   - **RT** — `RTPredictor`, input: peptide sequence —
-    `checkpoints/psmtag/dilated_cnn_v2.pt`
+    `checkpoint_path("psmtag")`
   - **IM** — `IMPredictor`, input: sequence + precursor charge (z 2-4) —
-    `checkpoints/im/dilated_cnn_v2.pt`
+    `checkpoint_path("im")`
 
 There is no label-free IM base yet; other chemistries are reachable from the
 nearest base via `calibrate()` (novel mods are added to the vocabulary
@@ -46,7 +46,8 @@ from jrif import RTPredictor
 # identified peptides from this experiment (1% FDR), observed RTs in native units
 ids_df = pd.read_csv("psm_ids.tsv", sep="\t")        # cols: seq, rt
 
-p = RTPredictor.from_checkpoint("checkpoints/psmtag/dilated_cnn_v2.pt")
+from jrif.checkpoints import checkpoint_path
+p = RTPredictor.from_checkpoint(checkpoint_path("psmtag"))
 report = p.calibrate(ids_df)                          # seq_col=/rt_col= to rename
 print(report)   # {'mode': 'warp+finetune', 'holdout_rank': 0.99, 'holdout_mae': ...}
 
@@ -118,7 +119,7 @@ library in ~2-3 minutes. No multi-GPU sharding.
 from jrif import IMPredictor
 
 ids = pd.DataFrame({"seq": [...], "charge": [...], "im": [...]})
-m = IMPredictor.from_checkpoint("checkpoints/im/dilated_cnn_v2.pt")
+m = IMPredictor.from_checkpoint(checkpoint_path("im"))
 m.calibrate(ids)                             # same warp-first design as RT
 library["pred_im"] = m.predict(library)      # library needs seq + charge cols
 ```
@@ -135,7 +136,7 @@ same `fit/predict/save/from_checkpoint` surface as RT; checkpoints are tagged
 experiment adaptation, `fit()` for custom workflows:
 
 ```python
-p = RTPredictor.from_checkpoint("checkpoints/psmtag/dilated_cnn_v2.pt")
+p = RTPredictor.from_checkpoint(checkpoint_path("psmtag"))
 p.fit(df, seq_col="seq", rt_col="rt",
       epochs=150, patience=20, lr=1e-3, batch_size=128,
       loss="mixture", selection_metric="mae", seed=42)
@@ -185,7 +186,7 @@ The IM base is trained through the Python API (no CLI yet): build the
 ```bash
 uv run jrif-predict \
   --input-tsv my_library.tsv --output-tsv my_library_predRT.tsv \
-  --checkpoint checkpoints/psmtag/dilated_cnn_v2.pt \
+  --checkpoint src/jrif/checkpoints/rt_psmtag.pt \
   [--add-psmtag]   # annotate N-termini and K with the tag before tokenization
 ```
 
@@ -224,7 +225,8 @@ src/jrif/                # runtime package — everything a consumer needs
     ├── train_label_free.py
     └── train_psmtag.py
 tests/                  # tokenizer, vocab-extension, calibrate, IM, checkpoint tests
-checkpoints/            # *.pt (gitignored): shipped v2 bases per property
+src/jrif/checkpoints/   # shipped weights, bundled into the wheel
+checkpoints/            # local-only training outputs (gitignored)
 data/                   # training libraries (gitignored; no LFS)
 ```
 

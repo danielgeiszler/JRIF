@@ -1,9 +1,20 @@
 [project]
 name = "jrif"
 version = "0.1.0"
-description = "Retention time prediction for proteomics peptides. Trains a label-free model on a DIA-NN library, fine-tunes to a modified-peptide (PSMtag) library, and predicts RT for arbitrary spectral libraries."
+description = "Peptide retention-time and ion-mobility prediction: pretrained bases, per-experiment calibration, full-library prediction."
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
+license = "Apache-2.0"
+authors = [{ name = "Daniel Geiszler", email = "dgeiszler@parallelsq.org" }]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
 dependencies = [
     "torch>=2.2",
     "pandas>=2.0",
@@ -19,6 +30,14 @@ dev = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[project.urls]
+Repository = "https://github.com/danielgeiszler/JRIF"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jrif"]
+# ship the .pt weights inside the wheel
+artifacts = ["src/jrif/checkpoints/*.pt"]
 
 [build-system]
 requires = ["hatchling"]
