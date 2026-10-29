@@ -54,6 +54,24 @@ def test_discover_tokens_finds_unknown():
 def test_discover_tokens_finds_nterm_mod():
     vocab = Vocabulary.default()
     new = discover_tokens([".[42.0]AAR", ".[308.1161]MCAR"], vocab)
-    assert new == {"n[+42.0]": None, "n[+308.1161]": None}
+    assert new == {"n[+42.0]": "<nterm>", "n[+308.1161]": "<nterm>"}
     vocab.extend("n[+308.1161]", None, fresh=True)
     assert not discover_tokens([".[308.1161]MCAR", ".[308]MCAR"], vocab)
+
+
+def test_new_mods_start_as_their_unmodified_form():
+    """Before any training, a peptide carrying a new mod predicts exactly like
+    its unmodified form: residue mods copy their residue, terminal mods copy
+    <nterm>/<cterm>."""
+    from jrif.api import _extend_for
+    torch.manual_seed(0)
+    model = RTModel(Vocabulary.default(), embedding_dim=16)
+    mods = ["n[+140.0950]PEPTIDEK", "PEPTIDEKc[+0.984]", "PEPS[80]TIDEK"]
+    plain = ["PEPTIDEK", "PEPTIDEK", "PEPSTIDEK"]
+    _extend_for(model, mods)
+    df = lambda seqs: pl.DataFrame({"seq": seqs, "rt": [0.0] * len(seqs)})
+    v = model.vocab
+    assert v.parent_of["n[+140.0950]"] == "<nterm>" and v.parent_of["c[+0.984]"] == "<cterm>"
+    a = _predict(model, RTDataset(df(mods), v, rt_median=0.0, rt_mad=1.0))
+    b = _predict(model, RTDataset(df(plain), v, rt_median=0.0, rt_mad=1.0))
+    assert torch.allclose(a, b, atol=1e-6)

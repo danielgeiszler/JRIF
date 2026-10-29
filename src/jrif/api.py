@@ -13,7 +13,7 @@ Calling `.fit(df)` will:
     not know yet,
   - log every modification in the data and whether it is new,
   - extend the embedding tables (a new residue mod starts from its residue's
-    row; a new terminal mod has no parent and is learned from scratch),
+    row, a new terminal mod from <nterm>'s or <cterm>'s),
   - robust z-score the RT column (median / MAD on the train split),
   - train (Muon for conv weights, AdamW elsewhere; cosine + linear warmup;
     optional early stopping on val R²), and
@@ -151,8 +151,7 @@ def _log_mods(seqs, vocab: Vocabulary) -> None:
         if tok is None:
             status = "AMBIGUOUS (matches several model tokens), skipped"
         else:
-            status = "known" if not new else (
-                f"NEW, initialized from {parent}" if parent else "NEW, learned from scratch")
+            status = "known" if not new else f"NEW, initialized from {parent}"
             if tok != spelling:
                 status += f" (as {tok})"
         print(f"  {spelling:<{width}}  {n:>8,} IDs  {status}", flush=True)
@@ -202,12 +201,13 @@ def _holdout_split(df_pl: pl.DataFrame, holdout_fraction: float, seed: int,
 
 
 def _extend_for(model: nn.Module, seqs) -> None:
-    """Add every token in `seqs` the vocabulary lacks. A new residue mod
-    starts from its residue's row; a new terminal mod has no parent and is
-    learned from scratch."""
+    """Add every token in `seqs` the vocabulary lacks. Each new token starts
+    as a copy of its parent's row — a residue mod from its residue, a terminal
+    mod from <nterm>/<cterm> — so before any training it behaves like the
+    unmodified residue or terminus."""
     new = discover_tokens(seqs, model.vocab)
     if new:
-        model.extend_vocab([(t, p, p is None) for t, p in new.items()])
+        model.extend_vocab([(t, p, False) for t, p in new.items()])
 
 
 def _make_optimizers(

@@ -62,9 +62,9 @@ def test_fit_extends_vocab_for_new_mod():
 
 
 def test_fit_detects_and_logs_every_mod(capsys):
-    """No declaration needed: a new residue mod inherits from its residue, a
-    new terminal mod is learned from scratch, and the log lists every mod
-    exactly as written, with the token it resolved to when that differs."""
+    """No declaration needed: a new residue mod starts from its residue, a
+    new terminal mod from <nterm>, and the log lists every mod exactly as
+    written, with the token it resolved to when that differs."""
     rng = np.random.default_rng(3)
     seqs = ["AS[80]K", ".[42]PEPS[80]TIDE", "AAAK", "M[147]CAR"] * 8
     rts = rng.normal(50, 5, size=len(seqs)).astype(np.float32)
@@ -74,12 +74,12 @@ def test_fit_detects_and_logs_every_mod(capsys):
                   seed=0, val_fraction=0.25, verbose=True)
     v = predictor.vocab
     assert v.parent_of["S[+80]"] == "S" and "S[+80]" not in v.fresh
-    assert "n[+42]" in v.fresh
+    assert v.parent_of["n[+42]"] == "<nterm>" and "n[+42]" not in v.fresh
     log = capsys.readouterr().out
     assert "3 modification(s) in data, 2 new" in log
     assert re.search(r"M\[147\]\s+8 IDs  known \(as M\[\+15\.9949\]\)", log)
     assert re.search(r"S\[80\]\s+16 IDs  NEW, initialized from S \(as S\[\+80\]\)", log)
-    assert re.search(r"\.\[42\]\s+8 IDs  NEW, learned from scratch \(as n\[\+42\]\)", log)
+    assert re.search(r"\.\[42\]\s+8 IDs  NEW, initialized from <nterm> \(as n\[\+42\]\)", log)
 
 def test_explicit_val_df():
     seqs, rts = _toy(n=80, seed=4)

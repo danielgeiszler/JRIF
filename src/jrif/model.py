@@ -59,15 +59,17 @@ def _z_score_per_feature(matrix: torch.Tensor) -> torch.Tensor:
 
 
 def _parent_aa_for(token: str, vocab: Vocabulary) -> Optional[str]:
-    """Return the canonical AA letter to inherit from, or None if the token
-    inherits nothing (pad / fresh / no parent)."""
+    """Return the canonical AA letter whose physico/global features the token
+    inherits, or None (pad / fresh / terminal tokens, whose parent is
+    <nterm>/<cterm> and which carry no residue features)."""
     if token == "<pad>":
         return None
     if token in CANONICAL_AAS:
         return token
     if token in vocab.fresh:
         return None
-    return vocab.parent_of.get(token)
+    parent = vocab.parent_of.get(token)
+    return parent if parent in CANONICAL_AAS else None
 
 
 def _build_physico_matrix(vocab: Vocabulary) -> torch.Tensor:
@@ -237,10 +239,11 @@ class RTModel(nn.Module):
         in-place. After calling this, any optimizer holding references to the
         old embedding parameters MUST be rebuilt.
 
-        new_tokens: iterable of (token, parent_aa | None, fresh: bool). The
-        parent's embedding row is copied for each new row (zero when there is
-        no parent or the token is fresh); physico and global lookup rows are
-        recomputed from vocab lineage.
+        new_tokens: iterable of (token, parent | None, fresh: bool). The
+        parent's embedding row (a residue, or <nterm>/<cterm> for a terminal
+        mod) is copied for each new row (zero when there is no parent or the
+        token is fresh); physico and global lookup rows are recomputed from
+        vocab lineage.
         """
         new = list(new_tokens)
         if not new:

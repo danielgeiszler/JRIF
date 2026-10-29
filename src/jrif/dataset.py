@@ -399,13 +399,15 @@ def tokenize(seq: str, vocab: Vocabulary) -> list[int]:
 
 def _written_mods(seqs: Iterable[str]) -> dict[str, tuple[int, str, Optional[str]]]:
     """Every mod in `seqs`, keyed by the text as written -> (n sequences
-    containing it, token name, parent residue or None for terminal mods)."""
+    containing it, token name, parent: the residue for a residue mod,
+    <nterm>/<cterm> for a terminal mod)."""
     found: dict[str, tuple[int, str, Optional[str]]] = {}
     for seq in seqs:
         if not isinstance(seq, str) or not seq:
             continue
         p = _parse(seq)
-        here = {t: None for t in (p.nterm, p.cterm) if isinstance(t, str)}
+        here = {t: free for t, free in ((p.nterm, FREE_NTERM), (p.cterm, FREE_CTERM))
+                if isinstance(t, str)}
         here.update({t: aa for aa, t in p.residues if isinstance(t, str) and t != aa})
         for t, parent in here.items():
             raw = p.spelled(t)
@@ -415,14 +417,15 @@ def _written_mods(seqs: Iterable[str]) -> dict[str, tuple[int, str, Optional[str
 
 def discover_tokens(
     seqs: Iterable[str], vocab: Vocabulary,
-) -> dict[str, Optional[str]]:
-    """Mods in `seqs` that match no `vocab` token, mapped to their parent
-    residue (None for terminal mods). Spellings that agree with each other
+) -> dict[str, str]:
+    """Mods in `seqs` that match no `vocab` token, mapped to the token they
+    start from: the residue for a residue mod, <nterm>/<cterm> for a terminal
+    mod. Spellings that agree with each other
     become one token, named by the most precise spelling. Spellings that
-    are ambiguous or fail to parse are skipped; `strict_filter` reports them."""
+    are ambiguous or fail to parse are skipped; `drop_untokenizable` reports them."""
     names = {t: parent for _, t, parent in _written_mods(seqs).values()}
     trial = vocab.copy()
-    new: dict[str, Optional[str]] = {}
+    new: dict[str, str] = {}
     for t in sorted(names, key=lambda t: (-_decimals(_mod_key(t)[1]), t)):
         try:
             if trial.match(t) is None:
@@ -439,8 +442,8 @@ def mod_census(
     """Every modification in `seqs`, as (spelling, n_ids, token, is_new,
     parent), sorted by spelling. spelling is the text exactly as written;
     token is the vocabulary token it resolves to once new tokens are added
-    (None if ambiguous); is_new is relative to `vocab`; parent is the
-    residue a new token inherits from (None: learned from scratch)."""
+    (None if ambiguous); is_new is relative to `vocab`; parent is the token
+    a new token starts from (its residue, or <nterm>/<cterm>)."""
     seqs = list(seqs)
     new = discover_tokens(seqs, vocab)
     trial = vocab.copy()
@@ -468,14 +471,12 @@ def tokenize_many(seqs: Iterable[str], vocab: Vocabulary) -> np.ndarray:
 def unique_rows(df: pl.DataFrame, cols: list[str]) -> tuple[pl.DataFrame, np.ndarray]:
     """Distinct rows of `df[cols]` (first-seen order) plus the inverse index:
     `unique[cols][inverse]` reconstructs `df[cols]` row for row."""
-    grouped = (
-        df.select(cols).with_row_index("__row__")
-        .group_by(cols, maintain_order=True).agg(pl.col("__row__"))
-    )
-    exploded = grouped.with_row_index("__u__").select("__u__", "__row__").explode("__row__")
-    inverse = np.empty(df.height, dtype=np.int64)
-    inverse[exploded["__row__"].to_numpy()] = exploded["__u__"].to_numpy()
-    return grouped.select(cols), inverse
+    # Each row's first occurrence; a dense rank of that index numbers the
+    # distinct rows in first-seen order.
+    idx = (df.select(cols).with_row_index("__row__")
+           .with_columns(pl.col("__row__").min().over(cols).alias("__first__")))
+    inverse = (idx["__first__"].rank("dense") - 1).cast(pl.Int64).to_numpy()
+    return idx.filter(pl.col("__row__") == pl.col("__first__")).select(cols), inverse
 
 
 def drop_untokenizable(

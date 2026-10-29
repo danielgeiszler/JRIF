@@ -9,8 +9,9 @@ and physico/global lookup buffers are sized from the Vocabulary at build
 time; `RTModel.extend_vocab(...)` grows them in-place when fine-tune data
 contains modification tokens the base model has not seen. Modifications are
 always detected from the data, never declared: `fit`/`calibrate` log every
-mod they see and whether it is new. A new residue mod's rows inherit from its
-residue; a new terminal mod has no parent and starts at zero.
+mod they see and whether it is new. A new mod's embedding row starts as a
+copy of its parent's: a residue mod's residue, a terminal mod's `<nterm>` or
+`<cterm>`. Before training it behaves like the unmodified residue/terminus.
 
 ## Hard rules
 
