@@ -37,8 +37,8 @@ from jrif.api import (
     _make_optimizers,
     _seed_everything,
 )
-from jrif.dataset import (MAX_LEN, Vocabulary, fit_rt_scale,
-                          drop_untokenizable, to_polars, tokenize)
+from jrif.dataset import (MAX_LEN, PREDICT_CHUNK_SIZE, Vocabulary, drop_untokenizable,
+                          fit_rt_scale, to_polars, tokenize_many, unique_rows)
 from jrif.loss import LaplaceUniformMixture
 from jrif.model import RTModel, DilatedBlock
 
@@ -95,10 +95,7 @@ class IMDataset(Dataset):
         df = to_polars(df)
         seqs = df[seq_col].to_list()
         n = len(seqs)
-        tok = np.zeros((n, MAX_LEN), dtype=np.int64)
-        for i, s in enumerate(seqs):
-            tok[i, :] = tokenize(s, vocab)
-        self.sequences = torch.from_numpy(tok)
+        self.sequences = torch.from_numpy(tokenize_many(seqs, vocab))
         self.charges = torch.from_numpy(
             df[charge_col].to_numpy().astype(np.float32) - 2.0)
         if im_col is None:
@@ -168,20 +165,27 @@ class IMPredictor:
 
     def predict(self, df: DataFrameLike, *, seq_col="seq", charge_col="charge",
                 batch_size: int = 2048, device: Optional[str] = None) -> np.ndarray:
+        """Predict IM for every row of `df`, in input order: each distinct
+        (seq, charge) pair runs through the model once, tokenized
+        PREDICT_CHUNK_SIZE pairs at a time (see RTPredictor.predict)."""
         device_t = torch.device(device if device else _auto_device())
         self.model.to(device_t).eval()
-        ds = IMDataset(to_polars(df), self.vocab, seq_col=seq_col, charge_col=charge_col,
-                       im_col=None, im_median=self.im_median, im_mad=self.im_mad)
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
-        preds = []
+        pairs, inverse = unique_rows(to_polars(df).select(seq_col, charge_col),
+                                     [seq_col, charge_col])
+        z = np.empty(pairs.height, dtype=np.float32)
         with torch.inference_mode():
-            for tok, ch, _ in loader:
-                preds.append(self.model(tok.to(device_t), ch.to(device_t)).cpu())
-        z = torch.cat(preds) if preds else torch.empty(0)
-        out = (z * self.im_mad + self.im_median).numpy()
+            for start in range(0, pairs.height, PREDICT_CHUNK_SIZE):
+                chunk = pairs.slice(start, PREDICT_CHUNK_SIZE)
+                tok = torch.from_numpy(tokenize_many(chunk[seq_col].to_list(), self.vocab))
+                ch = torch.from_numpy(chunk[charge_col].to_numpy().astype(np.float32) - 2.0)
+                for b in range(0, len(tok), batch_size):
+                    zb = self.model(tok[b:b + batch_size].to(device_t),
+                                    ch[b:b + batch_size].to(device_t)).cpu().numpy()
+                    z[start + b:start + b + len(zb)] = zb
+        out = z * self.im_mad + self.im_median
         if self.im_warp is not None:
-            return np.interp(out, self.im_warp[0], self.im_warp[1])
-        return out
+            out = np.interp(out, *self.im_warp)
+        return out[inverse]
 
     def calibrate(self, df: DataFrameLike, *, seq_col="seq", charge_col="charge",
                   im_col="im", device: Optional[str] = None, min_rank: float = 0.95,

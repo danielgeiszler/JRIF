@@ -43,6 +43,9 @@ from torch.utils.data import Dataset
 
 
 MAX_LEN = 50
+# Rows tokenized at once by predict(): bounds the int64[n, MAX_LEN] token
+# array to ~26 MB regardless of input size.
+PREDICT_CHUNK_SIZE = 65_536
 
 DEFAULT_TOKENS: dict[str, int] = {
     "<pad>": 0,
@@ -453,6 +456,28 @@ def mod_census(
     return out
 
 
+def tokenize_many(seqs: Iterable[str], vocab: Vocabulary) -> np.ndarray:
+    """Tokenize a batch of sequences into an int64[n, MAX_LEN] array."""
+    seqs = list(seqs)
+    out = np.zeros((len(seqs), MAX_LEN), dtype=np.int64)
+    for i, s in enumerate(seqs):
+        out[i, :] = tokenize(s, vocab)
+    return out
+
+
+def unique_rows(df: pl.DataFrame, cols: list[str]) -> tuple[pl.DataFrame, np.ndarray]:
+    """Distinct rows of `df[cols]` (first-seen order) plus the inverse index:
+    `unique[cols][inverse]` reconstructs `df[cols]` row for row."""
+    grouped = (
+        df.select(cols).with_row_index("__row__")
+        .group_by(cols, maintain_order=True).agg(pl.col("__row__"))
+    )
+    exploded = grouped.with_row_index("__u__").select("__u__", "__row__").explode("__row__")
+    inverse = np.empty(df.height, dtype=np.int64)
+    inverse[exploded["__row__"].to_numpy()] = exploded["__u__"].to_numpy()
+    return grouped.select(cols), inverse
+
+
 def drop_untokenizable(
     df: pl.DataFrame, vocab: Vocabulary, *, seq_col: str = "seq",
     will_extend: bool = False,
@@ -530,11 +555,7 @@ class RTDataset(Dataset):
         df = to_polars(df)
         seqs = df[seq_col].to_list()
         n = len(seqs)
-
-        tok_arr = np.zeros((n, MAX_LEN), dtype=np.int64)
-        for i, s in enumerate(seqs):
-            tok_arr[i, :] = tokenize(s, vocab)
-        self.sequences = torch.from_numpy(tok_arr)
+        self.sequences = torch.from_numpy(tokenize_many(seqs, vocab))
 
         if rt_col is None:
             self.rt_median = float(rt_median if rt_median is not None else 0.0)

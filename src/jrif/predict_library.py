@@ -8,6 +8,7 @@ library is implicitly PSMtag-tagged but not annotated in the sequence string.
 
 import argparse
 
+import numpy as np
 import polars as pl
 
 from jrif.api import RTPredictor
@@ -34,37 +35,35 @@ def main():
     print(f"  format: {fmt}  peptide_col={peptide_col}  rt_col={rt_col}")
     print(f"  {len(df):,} rows, {df[peptide_col].n_unique():,} unique peptides")
 
-    unique_peps = df.select(peptide_col).unique().with_row_index("__idx__")
+    seqs = df[peptide_col]
     if args.add_psmtag:
-        unique_peps = unique_peps.with_columns(
-            pl.col(peptide_col).map_elements(apply_psmtag, return_dtype=pl.Utf8).alias("seq")
-        )
+        uniq = seqs.drop_nulls().unique().to_list()
+        seqs = seqs.replace_strict({s: apply_psmtag(s) for s in uniq},
+                                   default=None, return_dtype=pl.Utf8)
         print("  (added PSMtag annotations to sequences for prediction)")
-    else:
-        unique_peps = unique_peps.with_columns(pl.col(peptide_col).alias("seq"))
 
     print(f"Loading checkpoint: {args.checkpoint}")
     predictor = RTPredictor.from_checkpoint(args.checkpoint, device=args.device)
     print(f"  RT scale: median={predictor.rt_median:.3f}, MAD={predictor.rt_mad:.3f}")
 
-    preds = predictor.predict(
-        unique_peps.select("seq"),
+    # predict() dedupes peptides internally and broadcasts back to rows.
+    # Rows with no peptide get no prediction; any other row predict() cannot
+    # represent raises.
+    has_seq = seqs.is_not_null().to_numpy()
+    rt = np.full(len(df), np.nan)
+    rt[has_seq] = predictor.predict(
+        pl.DataFrame({"seq": seqs.filter(pl.Series(has_seq))}),
         seq_col="seq",
         batch_size=args.batch_size,
         device=args.device,
     )
-    print(f"Predicted {len(preds):,} peptides. RT range: [{preds.min():.3f}, {preds.max():.3f}]")
+    print(f"Predicted {int(has_seq.sum()):,} rows. RT range: "
+          f"[{np.nanmin(rt):.3f}, {np.nanmax(rt):.3f}]")
+    out = df.with_columns(pl.Series(rt_col, rt).fill_nan(None))
 
-    pep_to_rt = dict(zip(unique_peps[peptide_col].to_list(), preds.tolist()))
-    out = df.with_columns(
-        pl.col(peptide_col).map_elements(
-            lambda s: pep_to_rt.get(s), return_dtype=pl.Float64,
-        ).alias(rt_col)
-    )
-
-    missing = out[rt_col].is_null().sum()
+    missing = int((~has_seq).sum())
     if missing:
-        print(f"WARN: {missing} rows have no prediction (NaN peptide?)")
+        print(f"WARN: {missing} rows have no peptide and no prediction")
 
     write_library_tsv(out, args.output_tsv)
     print(f"Wrote {len(out):,} rows to {args.output_tsv}")

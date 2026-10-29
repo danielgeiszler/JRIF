@@ -38,13 +38,16 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from jrif.dataset import (
+    PREDICT_CHUNK_SIZE,
     RTDataset,
     Vocabulary,
     discover_tokens,
+    drop_untokenizable,
     fit_rt_scale,
     mod_census,
-    drop_untokenizable,
     to_polars,
+    tokenize_many,
+    unique_rows,
 )
 from jrif.loss import LaplaceUniformMixture, NormalNormalMixture
 from jrif.model import RTModel
@@ -303,33 +306,32 @@ class RTPredictor:
         batch_size: int = 2048,
         device: Optional[str] = None,
     ) -> np.ndarray:
+        """Predict RT for every row of `df`, in input order.
+
+        Each distinct peptide runs through the model once and its prediction
+        is broadcast back to its rows; tokenization proceeds PREDICT_CHUNK_SIZE
+        peptides at a time, so peak memory does not grow with len(df).
+        Raises TokenizationError for any row that cannot be represented.
+        """
         device_t = torch.device(
             device if device else _auto_device()
         )
         self.model.to(device_t)
         self.model.eval()
 
-        df_pl = to_polars(df)
-        # RTDataset wants a Retention/rt placeholder; we don't use it.
-        df_with_rt = df_pl.with_columns(pl.lit(0.0).alias("__rt__"))
-        ds = RTDataset(
-            df_with_rt, self.vocab,
-            seq_col=seq_col, rt_col="__rt__",
-            rt_median=self.rt_median, rt_mad=self.rt_mad,
-        )
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
-
-        preds_z: list[torch.Tensor] = []
+        seqs, inverse = unique_rows(to_polars(df).select(seq_col), [seq_col])
+        z = np.empty(seqs.height, dtype=np.float32)
         with torch.inference_mode():
-            for seqs, _ in loader:
-                z = self.model(seqs.to(device_t)).cpu()
-                preds_z.append(z)
-        z = torch.cat(preds_z) if preds_z else torch.empty(0)
-        out = (z * self.rt_mad + self.rt_median).numpy()
+            for start in range(0, seqs.height, PREDICT_CHUNK_SIZE):
+                tok = torch.from_numpy(tokenize_many(
+                    seqs[seq_col].slice(start, PREDICT_CHUNK_SIZE).to_list(), self.vocab))
+                for b in range(0, len(tok), batch_size):
+                    zb = self.model(tok[b:b + batch_size].to(device_t)).cpu().numpy()
+                    z[start + b:start + b + len(zb)] = zb
+        out = z * self.rt_mad + self.rt_median
         if self.rt_warp is not None:
-            xk, yk = self.rt_warp
-            return np.interp(out, xk, yk)
-        return out
+            out = np.interp(out, *self.rt_warp)
+        return out[inverse]
 
     # ---- calibrate ----
 
