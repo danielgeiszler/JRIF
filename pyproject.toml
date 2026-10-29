@@ -1,6 +1,6 @@
 [project]
 name = "jrif"
-version = "0.1.2"
+version = "0.2.0"
 description = "Peptide retention-time and ion-mobility prediction: pretrained bases, per-experiment calibration, full-library prediction."
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
