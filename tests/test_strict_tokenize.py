@@ -87,3 +87,31 @@ def test_im_predict_raises_on_unrepresentable_rows():
     m = IMPredictor.from_blank()
     with pytest.raises(TokenizationError):
         m.predict(pl.DataFrame({"seq": ["PEPTIDEK", "PES[80]TIDEK"], "charge": [2, 3]}))
+
+
+def test_untokenizable_row_never_empties_validation():
+    """Unrepresentable rows are dropped before the train/val split, so with a
+    single validation slot no seed can leave validation empty."""
+    df = pl.DataFrame({"seq": ["PEPTIDEK", "ACDEFGHK", "A" * (MAX_LEN + 5)],
+                       "rt": [10.0, 20.0, 30.0]})
+    for seed in range(10):
+        p = RTPredictor.from_blank()
+        p.fit(df, epochs=1, val_fraction=0.34, seed=seed, device="cpu", verbose=False)
+        m = IMPredictor.from_blank()
+        m.fit(df.with_columns(charge=pl.lit(2), im=pl.col("rt") / 30), epochs=1,
+              val_fraction=0.34, seed=seed, device="cpu", verbose=False)
+
+
+def test_split_is_reproducible():
+    from jrif.api import _split_train_val
+    df = pl.DataFrame({"seq": [f"PEPTIDE{a}{b}K" for a in "ACDEFGH" for b in "LMNPQRS"],
+                       "rt": np.arange(49.0)})
+    first = _split_train_val(df, val_fraction=0.2, seed=3)[1]["seq"].to_list()
+    for _ in range(20):
+        assert _split_train_val(df, val_fraction=0.2, seed=3)[1]["seq"].to_list() == first
+
+
+def test_fit_with_nothing_to_validate_raises():
+    df = pl.DataFrame({"seq": ["PEPTIDEK", "A" * (MAX_LEN + 5)], "rt": [10.0, 30.0]})
+    with pytest.raises(ValueError, match="at least one training and one validation"):
+        RTPredictor.from_blank().fit(df, epochs=1, device="cpu", verbose=False)

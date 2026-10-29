@@ -127,8 +127,10 @@ def _auto_device() -> str:
 def _split_train_val(
     df: pl.DataFrame, val_fraction: float, seed: int,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Peptide-level split (avoids leakage when the same seq is repeated)."""
-    seqs = df["seq"].unique().to_list()
+    """Peptide-level split (avoids leakage when the same seq is repeated).
+    Peptides are taken in first-seen order before the seeded shuffle, so the
+    same rows and seed always give the same split."""
+    seqs = df["seq"].unique(maintain_order=True).to_list()
     rng = random.Random(seed)
     rng.shuffle(seqs)
     n_val = max(1, int(len(seqs) * val_fraction))
@@ -208,6 +210,12 @@ def _extend_for(model: nn.Module, seqs) -> None:
     new = discover_tokens(seqs, model.vocab)
     if new:
         model.extend_vocab([(t, p, False) for t, p in new.items()])
+
+
+def _require_rows(train_pl: pl.DataFrame, val_pl: pl.DataFrame) -> None:
+    if len(train_pl) == 0 or len(val_pl) == 0:
+        raise ValueError(f"fit() needs at least one training and one validation "
+                         f"ID; got {len(train_pl)} and {len(val_pl)}")
 
 
 def _make_optimizers(
@@ -664,6 +672,9 @@ class RTPredictor:
               .drop_nulls()
               .filter(pl.col("seq").str.len_chars() > 0)
         )
+        # Unrepresentable rows go before the split, so they can't empty it.
+        df_pl, n_bad_tr, first = drop_untokenizable(df_pl, self.vocab, will_extend=True)
+        n_bad_va, first_va = 0, None
         if val_df is not None:
             val_pl = (
                 to_polars(val_df)
@@ -671,15 +682,14 @@ class RTPredictor:
                   .drop_nulls()
                   .filter(pl.col("seq").str.len_chars() > 0)
             )
+            val_pl, n_bad_va, first_va = drop_untokenizable(val_pl, self.vocab, will_extend=True)
             train_pl = df_pl
         else:
             train_pl, val_pl = _split_train_val(df_pl, val_fraction=val_fraction, seed=seed)
-
-        train_pl, n_bad_tr, first = drop_untokenizable(train_pl, self.vocab, will_extend=True)
-        val_pl, n_bad_va, first_va = drop_untokenizable(val_pl, self.vocab, will_extend=True)
         if n_bad_tr + n_bad_va:
             print(f"jrif: skipped {n_bad_tr + n_bad_va} ID(s) that could not "
                   f"be tokenized (first: {first or first_va})", flush=True)
+        _require_rows(train_pl, val_pl)
         if verbose:
             print(f"Train: {len(train_pl)}, Val: {len(val_pl)}", flush=True)
 

@@ -14,7 +14,6 @@ targets, mixture loss, Muon+AdamW, cosine + warmup, val-MAE selection.
 from __future__ import annotations
 
 import copy
-import random
 from pathlib import Path
 from typing import Optional, Union
 
@@ -38,6 +37,8 @@ from jrif.api import (
     _load_checkpoint_dict,
     _log_mods,
     _make_optimizers,
+    _require_rows,
+    _split_train_val,
     _seed_everything,
 )
 from jrif.dataset import (MAX_LEN, PREDICT_CHUNK_SIZE, Vocabulary, drop_untokenizable,
@@ -291,25 +292,23 @@ class IMPredictor:
                           pl.col(charge_col).cast(pl.Float64).alias("charge"),
                           pl.col(im_col).cast(pl.Float64).alias("im")])
                  .drop_nulls())
+        # Unrepresentable rows go before the split, so they can't empty it.
+        df_pl, n_bad_tr, first = drop_untokenizable(df_pl, self.vocab, will_extend=True)
+        n_bad_va, first_va = 0, None
         if val_df is not None:
             val_pl = (to_polars(val_df)
                       .select([pl.col(seq_col).alias("seq"),
                                pl.col(charge_col).cast(pl.Float64).alias("charge"),
                                pl.col(im_col).cast(pl.Float64).alias("im")])
                       .drop_nulls())
+            val_pl, n_bad_va, first_va = drop_untokenizable(val_pl, self.vocab, will_extend=True)
             train_pl = df_pl
         else:
-            seqs = df_pl["seq"].unique().to_list()
-            rng = random.Random(seed); rng.shuffle(seqs)
-            val_seqs = set(seqs[:max(1, int(len(seqs) * val_fraction))])
-            is_val = df_pl["seq"].is_in(list(val_seqs))
-            train_pl, val_pl = df_pl.filter(~is_val), df_pl.filter(is_val)
-
-        train_pl, n_bad_tr, first = drop_untokenizable(train_pl, self.vocab, will_extend=True)
-        val_pl, n_bad_va, first_va = drop_untokenizable(val_pl, self.vocab, will_extend=True)
+            train_pl, val_pl = _split_train_val(df_pl, val_fraction=val_fraction, seed=seed)
         if n_bad_tr + n_bad_va:
             print(f"jrif: skipped {n_bad_tr + n_bad_va} ID(s) that could not "
                   f"be tokenized (first: {first or first_va})", flush=True)
+        _require_rows(train_pl, val_pl)
 
         all_seqs = train_pl["seq"].to_list() + val_pl["seq"].to_list()
         if verbose:
