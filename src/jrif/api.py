@@ -158,6 +158,49 @@ def _log_mods(seqs, vocab: Vocabulary) -> None:
         print(f"  {spelling:<{width}}  {n:>8,} IDs  {status}", flush=True)
 
 
+def _calibration_frame(df: DataFrameLike, seq_col: str,
+                       numeric: dict[str, str], key: list[str]) -> pl.DataFrame:
+    """calibrate() input -> (row, seq, *numeric) with `numeric` mapping
+    output name -> input column (cast to Float64). row is the position in
+    `df`. Null/empty rows are dropped, then rows are deduplicated on `key`
+    keeping the first, so which duplicate survives is deterministic."""
+    return (
+        to_polars(df)
+          .with_row_index("__jrif_row__")
+          .select([pl.col("__jrif_row__").alias("row"),
+                   pl.col(seq_col).alias("seq"),
+                   *[pl.col(src).cast(pl.Float64).alias(dst)
+                     for dst, src in numeric.items()]])
+          .drop_nulls()
+          .filter(pl.col("seq").str.len_chars() > 0)
+          .unique(subset=key, keep="first", maintain_order=True)
+    )
+
+
+def _calibration_input(df_pl: pl.DataFrame, vocab: Vocabulary,
+                       verbose: bool) -> pl.DataFrame:
+    """Drop rows that cannot be tokenized (one log line), then log every mod."""
+    df_pl, n_bad, first = drop_untokenizable(df_pl, vocab, will_extend=True)
+    if n_bad:
+        print(f"jrif: skipped {n_bad} ID(s) that could not be tokenized "
+              f"(first: {first})", flush=True)
+    if verbose:
+        _log_mods(df_pl["seq"].to_list(), vocab)
+    return df_pl
+
+
+def _holdout_split(df_pl: pl.DataFrame, holdout_fraction: float, seed: int,
+                   ) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Seeded (holdout, calibration) split of a cleaned calibration frame.
+    The frame's order is deterministic (_calibration_frame), so the same IDs
+    and seed always give the same split; report["holdout"]["row"] recovers it."""
+    n = len(df_pl)
+    order = list(range(n))
+    random.Random(seed).shuffle(order)
+    n_hold = max(10, int(n * holdout_fraction))
+    return df_pl[order[:n_hold]], df_pl[order[n_hold:]]
+
+
 def _extend_for(model: nn.Module, seqs) -> None:
     """Add every token in `seqs` the vocabulary lacks. A new residue mod
     starts from its residue's row; a new terminal mod has no parent and is
@@ -374,38 +417,34 @@ class RTPredictor:
         experiments (where training overfits) automatically resolve to
         warp-only. Returns a report dict: mode is one of "warp",
         "warp+finetune", "finetune_raw".
+
+        report["holdout"] is a polars frame (row, seq, rt, pred): row is the
+        position in `df` of each held-out ID, pred is what holdout_mae was
+        computed from. The split is deterministic: input rows are
+        deduplicated on seq keeping the first occurrence, then shuffled with
+        `seed`. The holdout drives the decisions above (rank gate, epoch
+        selection, warp vs warp+finetune), so holdout_mae is a selection
+        score; score IDs never passed to calibrate() for an unbiased one.
         """
+        df_pl = _calibration_frame(df, seq_col, {"rt": rt_col}, key=["seq"])
+        df_pl = _calibration_input(df_pl, self.vocab, verbose)
+        run = self._calibrate_curriculum if curriculum else self._calibrate_single
+        return run(df_pl, device=device, min_rank=min_rank,
+                   holdout_fraction=holdout_fraction, seed=seed,
+                   verbose=verbose, **fit_kwargs)
+
+    def _calibrate_single(self, df_pl: pl.DataFrame, *, device, min_rank,
+                          holdout_fraction, seed, verbose, **fit_kwargs) -> dict:
+        """Single-phase calibrate on a cleaned _calibration_frame (row, seq, rt)."""
         from scipy.stats import spearmanr
         from sklearn.isotonic import IsotonicRegression
 
-        if curriculum:
-            return self._calibrate_curriculum(
-                df, seq_col=seq_col, rt_col=rt_col, device=device,
-                min_rank=min_rank, holdout_fraction=holdout_fraction,
-                seed=seed, verbose=verbose, **fit_kwargs)
-
-        df_pl = (
-            to_polars(df)
-              .select([pl.col(seq_col).alias("seq"), pl.col(rt_col).cast(pl.Float64).alias("rt")])
-              .drop_nulls()
-              .filter(pl.col("seq").str.len_chars() > 0)
-              .unique(subset=["seq"])
-        )
-        df_pl, n_bad, first = drop_untokenizable(df_pl, self.vocab, will_extend=True)
-        if n_bad:
-            print(f"jrif: skipped {n_bad} ID(s) that could not be tokenized "
-                  f"(first: {first})", flush=True)
-        if verbose:
-            _log_mods(df_pl["seq"].to_list(), self.vocab)
         # New tokens are added before anything is scored, so the frozen-base
         # rank check and warp see every ID (a new residue mod starts as its
         # residue) and the base-weight snapshot below matches the model shape.
         _extend_for(self.model, df_pl["seq"].to_list())
         n = len(df_pl)
-        rng = random.Random(seed)
-        order = list(range(n)); rng.shuffle(order)
-        n_hold = max(10, int(n * holdout_fraction))
-        hold, cal = df_pl[order[:n_hold]], df_pl[order[n_hold:]]
+        hold, cal = _holdout_split(df_pl, holdout_fraction, seed)
         y_hold = hold["rt"].to_numpy()
 
         self.rt_warp = None
@@ -421,10 +460,12 @@ class RTPredictor:
                       f"{min_rank}); fine-tuning on raw targets", flush=True)
             fit_kwargs.setdefault("lr", FINETUNE_LR)
             fit_kwargs.setdefault("verbose", verbose)
-            self.fit(df_pl, seq_col="seq", rt_col="rt", val_df=hold,
+            # train on cal only: the holdout is scored below
+            self.fit(cal, seq_col="seq", rt_col="rt", val_df=hold,
                      device=device, seed=seed, **{**SHIPPING_RECIPE, **fit_kwargs})
             pred = self.predict(hold, seq_col="seq", device=device)
             report["holdout_mae"] = float(np.abs(pred - y_hold).mean())
+            report["holdout"] = hold.with_columns(pl.Series("pred", pred))
             report["mode"] = "finetune_raw"
             return report
 
@@ -465,6 +506,7 @@ class RTPredictor:
             self.rt_warp = fit_warp(z_all, df_pl["rt"].to_numpy())
             report["mode"] = "warp+finetune"
             report["holdout_mae"] = ft_hold_mae
+            hold_pred = np.interp(z_hold2, xk2, yk2)
         else:
             # training hurt (tiny N): restore base weights, warp-only on ALL ids
             self.model.load_state_dict(base_state)
@@ -472,27 +514,23 @@ class RTPredictor:
             self.rt_warp = fit_warp(z_all, df_pl["rt"].to_numpy())
             report["mode"] = "warp"
             report["holdout_mae"] = warp_hold_mae
+            hold_pred = np.interp(z_hold, xk, yk)
+        report["holdout"] = hold.with_columns(pl.Series("pred", hold_pred))
         if verbose:
             print(f"calibrate: {report['mode']} (holdout rank {rank:.4f}; "
                   f"warp-only {warp_hold_mae:.4f} vs warp+ft {ft_hold_mae:.4f})", flush=True)
         return report
 
-    def _calibrate_curriculum(self, df, *, seq_col, rt_col, device,
+    def _calibrate_curriculum(self, df_pl: pl.DataFrame, *, device,
                               min_rank, holdout_fraction, seed, verbose,
                               **fit_kwargs) -> dict:
         """Stage 1: calibrate on vocabulary-complete peptides. Stage 2:
         extend vocab and continue fine-tuning on the full set through the
         stage-1 warp; refit the warp. Falls back to single-phase when there
-        are no novel tokens or too few clean peptides."""
+        are no novel tokens or too few clean peptides. The report's holdout
+        and holdout_mae are stage 1's; stage 2 trains on those rows."""
         from sklearn.isotonic import IsotonicRegression
 
-        df_pl = (
-            to_polars(df)
-              .select([pl.col(seq_col).alias("seq"), pl.col(rt_col).cast(pl.Float64).alias("rt")])
-              .drop_nulls()
-              .filter(pl.col("seq").str.len_chars() > 0)
-              .unique(subset=["seq"])
-        )
         novel = set(discover_tokens(df_pl["seq"].to_list(), self.vocab))
         if novel:
             def has_novel(seq: str) -> bool:
@@ -505,13 +543,13 @@ class RTPredictor:
             if verbose and novel:
                 print("calibrate(curriculum): too few vocabulary-complete "
                       "peptides; using single-phase", flush=True)
-            return self.calibrate(df_pl, device=device, min_rank=min_rank,
-                                  holdout_fraction=holdout_fraction, seed=seed,
-                                  verbose=verbose, curriculum=False, **fit_kwargs)
+            return self._calibrate_single(df_pl, device=device, min_rank=min_rank,
+                                          holdout_fraction=holdout_fraction, seed=seed,
+                                          verbose=verbose, **fit_kwargs)
 
-        report = self.calibrate(clean, device=device, min_rank=min_rank,
-                                holdout_fraction=holdout_fraction, seed=seed,
-                                verbose=verbose, curriculum=False, **fit_kwargs)
+        report = self._calibrate_single(clean, device=device, min_rank=min_rank,
+                                        holdout_fraction=holdout_fraction, seed=seed,
+                                        verbose=verbose, **fit_kwargs)
         stage1_mode = report["mode"]
         if self.rt_warp is None:
             # stage 1 fell back to raw fine-tuning; continue single-phase on all

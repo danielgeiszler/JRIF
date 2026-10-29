@@ -31,7 +31,10 @@ from jrif.api import (
     DataFrameLike,
     FitResult,
     _auto_device,
+    _calibration_frame,
+    _calibration_input,
     _extend_for,
+    _holdout_split,
     _load_checkpoint_dict,
     _log_mods,
     _make_optimizers,
@@ -196,28 +199,21 @@ class IMPredictor:
         base, fine-tune on inverse-warped targets, keep warp-only or
         warp+finetune by holdout MAE; fall back to raw fine-tuning only when
         the base cannot rank the holdout (Spearman < min_rank). Charge is a
-        model input, so one global warp suffices."""
+        model input, so one global warp suffices.
+
+        As in RTPredictor.calibrate, report["holdout"] is a polars frame
+        (row, seq, charge, im, pred) with row = position in `df`; the split is
+        deterministic (dedupe on (seq, charge) keeping the first occurrence,
+        then a `seed` shuffle) and holdout_mae is a selection score."""
         from scipy.stats import spearmanr
         from sklearn.isotonic import IsotonicRegression
 
-        df_pl = (to_polars(df)
-                 .select([pl.col(seq_col).alias("seq"),
-                          pl.col(charge_col).cast(pl.Float64).alias("charge"),
-                          pl.col(im_col).cast(pl.Float64).alias("im")])
-                 .drop_nulls().unique(subset=["seq", "charge"]))
-        df_pl, n_bad, first = drop_untokenizable(
-            df_pl, self.vocab, will_extend=True)
-        if n_bad:
-            print(f"jrif: skipped {n_bad} ID(s) that could not be tokenized "
-                  f"(first: {first})", flush=True)
-        if verbose:
-            _log_mods(df_pl["seq"].to_list(), self.vocab)
+        df_pl = _calibration_frame(df, seq_col, {"charge": charge_col, "im": im_col},
+                                   key=["seq", "charge"])
+        df_pl = _calibration_input(df_pl, self.vocab, verbose)
         _extend_for(self.model, df_pl["seq"].to_list())  # see RTPredictor.calibrate
         n = len(df_pl)
-        rng = random.Random(seed)
-        order = list(range(n)); rng.shuffle(order)
-        n_hold = max(10, int(n * holdout_fraction))
-        hold, cal = df_pl[order[:n_hold]], df_pl[order[n_hold:]]
+        hold, cal = _holdout_split(df_pl, holdout_fraction, seed)
         y_hold = hold["im"].to_numpy()
 
         self.im_warp = None
@@ -230,9 +226,11 @@ class IMPredictor:
                 print(f"calibrate: warp unusable (holdout rank {rank:.4f}); "
                       f"fine-tuning on raw targets", flush=True)
             fit_kwargs.setdefault("verbose", verbose)
-            self.fit(df_pl, val_df=hold, device=device, seed=seed, **fit_kwargs)
-            report["holdout_mae"] = float(np.abs(
-                self.predict(hold, device=device) - y_hold).mean())
+            # train on cal only: the holdout is scored below
+            self.fit(cal, val_df=hold, device=device, seed=seed, **fit_kwargs)
+            pred = self.predict(hold, device=device)
+            report["holdout_mae"] = float(np.abs(pred - y_hold).mean())
+            report["holdout"] = hold.with_columns(pl.Series("pred", pred))
             report["mode"] = "finetune_raw"
             return report
 
@@ -265,11 +263,14 @@ class IMPredictor:
             z_all = self.predict(df_pl, device=device)
             self.im_warp = fit_warp(z_all, df_pl["im"].to_numpy())
             report["mode"] = "warp+finetune"; report["holdout_mae"] = ft_hold_mae
+            hold_pred = np.interp(z_hold2, xk2, yk2)
         else:
             self.model.load_state_dict(base_state)
             z_all = self.predict(df_pl, device=device)
             self.im_warp = fit_warp(z_all, df_pl["im"].to_numpy())
             report["mode"] = "warp"; report["holdout_mae"] = warp_hold_mae
+            hold_pred = np.interp(z_hold, xk, yk)
+        report["holdout"] = hold.with_columns(pl.Series("pred", hold_pred))
         if verbose:
             print(f"calibrate: {report['mode']} (rank {rank:.4f}; warp-only "
                   f"{warp_hold_mae:.4f} vs warp+ft {ft_hold_mae:.4f})", flush=True)
