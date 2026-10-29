@@ -1,5 +1,6 @@
 """End-to-end smoke tests for RTPredictor on tiny synthetic DataFrames."""
 
+import re
 import numpy as np
 import pandas as pd
 import polars as pl
@@ -50,27 +51,35 @@ def test_fit_extends_vocab_for_new_mod():
     df = pl.DataFrame({"seq": seqs, "rt": rts})
 
     predictor = RTPredictor.from_blank()
-    assert "S[80]" not in predictor.vocab.tokens
+    assert "S[+80]" not in predictor.vocab.tokens
     predictor.fit(df, epochs=1, batch_size=16, warmup_epochs=0, lr=1e-3,
                   seed=0, val_fraction=0.2, verbose=False)
-    assert "S[80]" in predictor.vocab.tokens
-    assert predictor.vocab.parent_of.get("S[80]") == "S"
+    assert "S[+80]" in predictor.vocab.tokens
+    assert predictor.vocab.parent_of.get("S[+80]") == "S"
 
     preds = predictor.predict(df)
     assert preds.shape == (len(df),)
 
 
-def test_fresh_mods_flag():
+def test_fit_detects_and_logs_every_mod(capsys):
+    """No declaration needed: a new residue mod inherits from its residue, a
+    new terminal mod is learned from scratch, and the log lists every mod
+    exactly as written, with the token it resolved to when that differs."""
     rng = np.random.default_rng(3)
-    seqs = ["AS[80]K", "PEPS[80]TIDE", "AAAK", "MCAR"] * 8
+    seqs = ["AS[80]K", ".[42]PEPS[80]TIDE", "AAAK", "M[147]CAR"] * 8
     rts = rng.normal(50, 5, size=len(seqs)).astype(np.float32)
     df = pl.DataFrame({"seq": seqs, "rt": rts})
     predictor = RTPredictor.from_blank()
     predictor.fit(df, epochs=1, batch_size=8, warmup_epochs=0, lr=1e-3,
-                  seed=0, val_fraction=0.25, verbose=False,
-                  fresh_mods=["S[80]"])
-    assert "S[80]" in predictor.vocab.fresh
-
+                  seed=0, val_fraction=0.25, verbose=True)
+    v = predictor.vocab
+    assert v.parent_of["S[+80]"] == "S" and "S[+80]" not in v.fresh
+    assert "n[+42]" in v.fresh
+    log = capsys.readouterr().out
+    assert "3 modification(s) in data, 2 new" in log
+    assert re.search(r"M\[147\]\s+8 IDs  known \(as M\[\+15\.9949\]\)", log)
+    assert re.search(r"S\[80\]\s+16 IDs  NEW, initialized from S \(as S\[\+80\]\)", log)
+    assert re.search(r"\.\[42\]\s+8 IDs  NEW, learned from scratch \(as n\[\+42\]\)", log)
 
 def test_explicit_val_df():
     seqs, rts = _toy(n=80, seed=4)

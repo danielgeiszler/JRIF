@@ -48,8 +48,9 @@ def load_report_lib_parquet(
     max_q_value: float = 0.01,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """search-engine report-library parquet. Drops decoys, filters to Q.Value <=
-    max_q_value, canonicalizes (tag)/(UniMod:n) notation to JRIF psmtag
-    format, averages RT per modified sequence. Output columns: `seq`, `rt`."""
+    max_q_value, rewrites the report's `(tag)` label as the PSMtag delta
+    (`(UniMod:n)` is tokenized natively), averages RT per modified sequence.
+    Output columns: `seq`, `rt`."""
     df = pl.read_parquet(
         path, columns=["Modified.Sequence", "RT", "Decoy", "Q.Value"],
         use_pyarrow=True,
@@ -59,10 +60,8 @@ def load_report_lib_parquet(
           .group_by("Modified.Sequence").agg(pl.col("RT").mean().alias("rt"))
           .with_columns(
               pl.col("Modified.Sequence")
-                .str.replace(r"^\(tag\)", ".[308]")
-                .str.replace_all(r"\(tag\)", "[308]")
-                .str.replace_all(r"\(UniMod:4\)", "[160]")
-                .str.replace_all(r"\(UniMod:35\)", "[147]")
+                .str.replace(r"^\(tag\)", "n[+308.1161]")
+                .str.replace_all(r"\(tag\)", "[+308.1161]")
                 .alias("seq"))
           .select(["seq", "rt"])
     )
@@ -75,7 +74,7 @@ def load_report_lib_parquet_im(
     split_dir: str | Path | None = None,
     max_q_value: float = 0.01,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """Report-library parquet for IM: same filtering and canonicalization as
+    """Report-library parquet for IM: same filtering and `(tag)` rewrite as
     load_report_lib_parquet, IM averaged per (modified sequence, charge).
     Split is at the peptide level so no peptide's charge states straddle
     splits. Output columns: `seq`, `charge`, `im`."""
@@ -89,10 +88,8 @@ def load_report_lib_parquet_im(
           .agg(pl.col("IM").mean().alias("im"))
           .with_columns(
               pl.col("Modified.Sequence")
-                .str.replace(r"^\(tag\)", ".[308]")
-                .str.replace_all(r"\(tag\)", "[308]")
-                .str.replace_all(r"\(UniMod:4\)", "[160]")
-                .str.replace_all(r"\(UniMod:35\)", "[147]")
+                .str.replace(r"^\(tag\)", "n[+308.1161]")
+                .str.replace_all(r"\(tag\)", "[+308.1161]")
                 .alias("seq"),
               pl.col("Precursor.Charge").cast(pl.Int64).alias("charge"))
           .select(["seq", "charge", "im"])

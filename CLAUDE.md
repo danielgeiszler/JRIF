@@ -7,9 +7,10 @@
 a robust z-score scale `(rt_median, rt_mad)`. The model's embedding tables
 and physico/global lookup buffers are sized from the Vocabulary at build
 time; `RTModel.extend_vocab(...)` grows them in-place when fine-tune data
-contains modification tokens the base model has not seen. New rows inherit
-from the parent residue's row by default; tokens listed in `fresh_mods=...`
-opt out of inheritance and start at zero (the K[308] precedent).
+contains modification tokens the base model has not seen. Modifications are
+always detected from the data, never declared: `fit`/`calibrate` log every
+mod they see and whether it is new. A new residue mod's rows inherit from its
+residue; a new terminal mod has no parent and starts at zero.
 
 ## Hard rules
 
@@ -67,6 +68,16 @@ opt out of inheritance and start at zero (the K[308] precedent).
   accepts only the current version and tells the user to retrain otherwise.
   Bump `CHECKPOINT_FORMAT_VERSION` whenever the input representation or
   architecture changes.
+
+- **One modification notation, as written.** Tokens are
+  `<site>[<signed delta>]` (site = residue, `n` or `c`) keeping the precision
+  the user wrote; known chemistry (UniMod table, LEGACY_ALIASES) is named at
+  4 decimals. Written mods match vocab tokens at the coarser precision; the
+  Vocabulary refuses two tokens on a site that agree that way, and an
+  ambiguous match raises. Users always get back what they gave: logs and
+  errors quote their spelling, never only our canonical name. Never invent
+  precision, and never add a rename-on-load path for vocab names — rename
+  the shipped artifacts instead.
 
 - **Internal data shape is polars.** `RTDataset` and
   `RTPredictor` accept either pandas or polars at the boundary and convert

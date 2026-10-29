@@ -24,7 +24,7 @@ def test_charge_changes_prediction():
     m = IMModel(Vocabulary.default())
     m.eval()
     v = m.vocab
-    x = torch.tensor([[v.tokens["A"], v.tokens["C[160]"], v.tokens["K"]] + [0] * 47])
+    x = torch.tensor([[v.tokens["A"], v.tokens["C[+57.0215]"], v.tokens["K"]] + [0] * 47])
     with torch.no_grad():
         p2 = m(x, torch.tensor([0.0]))
         p3 = m(x, torch.tensor([1.0]))
@@ -62,7 +62,7 @@ def test_fit_discovers_new_tokens():
     df["seq"] = ".[308]" + df["seq"]
     p = IMPredictor.from_blank()
     p.fit(df, epochs=1, device="cpu", verbose=False)
-    assert ".[308]" in p.vocab.tokens
+    assert "n[+308.1161]" in p.vocab.tokens
 
 
 def test_im_calibrate_warp_path_and_roundtrip(tmp_path):

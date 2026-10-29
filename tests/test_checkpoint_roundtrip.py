@@ -47,11 +47,11 @@ def test_save_load_with_extended_vocab(tmp_path):
     predictor = RTPredictor.from_blank()
     predictor.fit(df, epochs=1, batch_size=8, warmup_epochs=0, lr=1e-3,
                   seed=0, val_fraction=0.25, verbose=False)
-    assert "S[80]" in predictor.vocab.tokens
+    assert "S[+80]" in predictor.vocab.tokens
 
     p = tmp_path / "ckpt.pt"
     predictor.save(p)
 
     loaded = RTPredictor.from_checkpoint(p)
-    assert "S[80]" in loaded.vocab.tokens
+    assert "S[+80]" in loaded.vocab.tokens
     np.testing.assert_allclose(predictor.predict(df), loaded.predict(df), rtol=0, atol=1e-5)

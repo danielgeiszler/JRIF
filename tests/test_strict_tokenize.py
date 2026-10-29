@@ -9,44 +9,37 @@ from jrif.dataset import MAX_LEN, Vocabulary, tokenize
 VOCAB = Vocabulary.default()
 
 
-def test_strict_passes_on_known_sequence():
-    t = tokenize("PEPTIDEK", VOCAB, strict=True)
+def test_known_sequence_tokenizes():
+    t = tokenize("PEPTIDEK", VOCAB)
     assert sum(1 for x in t if x != 0) == 10  # 8 residues + both termini
 
 
-def test_strict_raises_on_unknown_mod():
-    tokenize("PES[80]TIDEK", VOCAB)  # lenient: falls back to bare S
+def test_unknown_mod_raises():
     with pytest.raises(TokenizationError, match=r"S\[80\]"):
-        tokenize("PES[80]TIDEK", VOCAB, strict=True)
+        tokenize("PES[80]TIDEK", VOCAB)
 
 
-def test_strict_raises_on_unknown_nterm_mod():
+def test_unknown_nterm_mod_raises():
     with pytest.raises(TokenizationError, match="N-terminal"):
-        tokenize(".[999]PEPTIDEK", VOCAB, strict=True)
+        tokenize(".[999]PEPTIDEK", VOCAB)
 
 
-def test_strict_raises_on_empty_or_non_string():
+def test_empty_or_non_string_raises():
     with pytest.raises(TokenizationError):
-        tokenize("", VOCAB, strict=True)
+        tokenize("", VOCAB)
     with pytest.raises(TokenizationError):
-        tokenize(None, VOCAB, strict=True)
+        tokenize(None, VOCAB)
 
 
-def test_strict_raises_on_truncation():
-    seq = "A" * (MAX_LEN + 1)
-    t = tokenize(seq, VOCAB)  # lenient: truncated
-    assert len(t) == MAX_LEN
+def test_over_length_raises():
     with pytest.raises(TokenizationError, match="MAX_LEN"):
-        tokenize(seq, VOCAB, strict=True)
+        tokenize("A" * (MAX_LEN + 1), VOCAB)
 
 
-def test_rt_predict_strict_default_raises_and_opt_out_works():
+def test_rt_predict_raises_on_unrepresentable_rows():
     p = RTPredictor.from_blank()
-    lib = pl.DataFrame({"seq": ["PEPTIDEK", "PES[80]TIDEK"]})
     with pytest.raises(TokenizationError):
-        p.predict(lib)
-    out = p.predict(lib, strict=False)
-    assert out.shape == (2,) and np.all(np.isfinite(out))
+        p.predict(pl.DataFrame({"seq": ["PEPTIDEK", "PES[80]TIDEK"]}))
 
 
 def test_fit_skips_untokenizable_rows_with_one_log_line(capsys):
@@ -74,7 +67,7 @@ def test_fit_still_learns_novel_mods_without_skipping(capsys):
     df = pl.DataFrame({"seq": seqs, "rt": list(np.linspace(0.0, 60.0, len(seqs)))})
     p.fit(df, epochs=1, verbose=False)
     assert "jrif: skipped" not in capsys.readouterr().out
-    assert "S[80]" in p.vocab.tokens
+    assert "S[+80]" in p.vocab.tokens
 
 
 def test_calibrate_skips_untokenizable_rows(capsys):
@@ -90,10 +83,7 @@ def test_calibrate_skips_untokenizable_rows(capsys):
     assert report["n"] == 120
 
 
-def test_im_predict_strict_default_raises_and_opt_out_works():
+def test_im_predict_raises_on_unrepresentable_rows():
     m = IMPredictor.from_blank()
-    lib = pl.DataFrame({"seq": ["PEPTIDEK", "PES[80]TIDEK"], "charge": [2, 3]})
     with pytest.raises(TokenizationError):
-        m.predict(lib)
-    out = m.predict(lib, strict=False)
-    assert out.shape == (2,) and np.all(np.isfinite(out))
+        m.predict(pl.DataFrame({"seq": ["PEPTIDEK", "PES[80]TIDEK"], "charge": [2, 3]}))

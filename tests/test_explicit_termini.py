@@ -15,16 +15,16 @@ def _nonpad(ids):
 
 def test_free_termini_wrap_unmodified_peptide():
     v = Vocabulary.default()
-    ids = _nonpad(tokenize("PEPTIDEK", v, strict=True))
+    ids = _nonpad(tokenize("PEPTIDEK", v))
     assert len(ids) == 10
     assert ids[0] == v.tokens[FREE_NTERM] and ids[-1] == v.tokens[FREE_CTERM]
 
 
 def test_nterm_mod_replaces_free_nterm():
     v = Vocabulary.default()
-    v.extend(".[308]", None, fresh=True)
-    ids = _nonpad(tokenize(".[308]PEPTIDEK[308]", v, strict=True))
-    assert ids[0] == v.tokens[".[308]"] and ids[-1] == v.tokens[FREE_CTERM]
+    v.extend("n[+308.1161]", None, fresh=True)
+    ids = _nonpad(tokenize(".[308]PEPTIDEK[308]", v))
+    assert ids[0] == v.tokens["n[+308.1161]"] and ids[-1] == v.tokens[FREE_CTERM]
     assert v.tokens[FREE_NTERM] not in ids
     assert len(ids) == 10
 
@@ -43,7 +43,7 @@ def test_fit_predict_roundtrip_with_tagged_and_free_termini(tmp_path):
     seqs = seqs + [".[308]" + s for s in seqs]
     df = pl.DataFrame({"seq": seqs, "rt": list(np.linspace(0.0, 60.0, len(seqs)))})
     p.fit(df, epochs=1, verbose=False)
-    assert ".[308]" in p.vocab.tokens
+    assert "n[+308.1161]" in p.vocab.tokens
     p.save(tmp_path / "m.pt")
     q = RTPredictor.from_checkpoint(tmp_path / "m.pt")
     assert q.vocab.tokens == p.vocab.tokens

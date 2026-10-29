@@ -13,7 +13,7 @@ from jrif.model import RTModel
 
 def _psmtag_vocab():
     v = Vocabulary.default()
-    v.extend(".[308]", None, fresh=True)
+    v.extend("n[+308.1161]", None, fresh=True)
     return v
 
 
@@ -29,7 +29,7 @@ def test_extend_vocab_does_not_perturb_existing_predictions():
     x = torch.tensor([tokenize(".[308]ACK[308]", m.vocab)])
     with torch.no_grad():
         before = m(x).clone()
-    m.extend_vocab([("S[80]", "S", False), (".[999]", None, True)])
+    m.extend_vocab([("S[+80]", "S", False), ("n[+999]", None, True)])
     m.eval()
     with torch.no_grad():
         after = m(x)
@@ -46,7 +46,7 @@ def test_fit_predict_checkpoint_roundtrip(tmp_path):
     p.fit(df, epochs=2, device="cpu", verbose=False)
     preds = p.predict(df, device="cpu")
     assert preds.shape == (200,)
-    assert ".[308]" in p.vocab.tokens  # discovered and learned
+    assert "n[+308.1161]" in p.vocab.tokens  # discovered and learned
 
     path = tmp_path / "rt.pt"
     p.save(path)
@@ -109,7 +109,7 @@ def test_calibrate_curriculum_with_novel_tokens(tmp_path):
     new.loc[mod, "seq"] = new.loc[mod, "seq"].str.replace("A", "A[42]", n=1)
     rep = p.calibrate(new, device="cpu", verbose=False, curriculum=True, epochs=2)
     assert rep["mode"] in ("curriculum", "curriculum_raw")
-    assert "A[42]" in p.vocab.tokens
+    assert "A[+42]" in p.vocab.tokens
     preds = p.predict(new.head(20), device="cpu")
     assert np.isfinite(preds).all()
 
@@ -122,3 +122,27 @@ def test_calibrate_curriculum_no_novel_tokens_falls_through():
     p = RTPredictor.from_blank()
     rep = p.calibrate(df, device="cpu", verbose=False, curriculum=True, epochs=2)
     assert rep["mode"] == "finetune_raw"   # unrankable -> single-phase fallback
+
+
+def test_calibrate_with_novel_mod_learns_it_in_every_mode():
+    """New tokens are added before the base snapshot, so restoring the base
+    weights (warp-only) works and the new mod is predictable either way."""
+    rng = np.random.default_rng(0)
+    aas = list("ACDEFGHIKLMNPQRSTVWY")
+    w = dict(zip(aas, rng.normal(0, 3, 20)))
+    seqs = ["".join(rng.choice(aas, rng.integers(7, 20))) for _ in range(400)]
+    df = pd.DataFrame({"seq": seqs, "rt": [50 + sum(w[a] for a in s) for s in seqs]})
+    p = RTPredictor.from_blank()
+    p.fit(df, epochs=60, lr=1e-3, device="cpu", verbose=False)
+    new = df.assign(rt=np.exp(df["rt"] / 25.0).clip(upper=1e6))
+    mod = rng.random(len(new)) < 0.25
+    new.loc[mod, "seq"] = new.loc[mod, "seq"].str.replace("A", "A[42]", n=1)
+    # lr=5 wrecks fine-tuning, so warp-only wins and the base weights are restored
+    for lr, modes in ((5.0, {"warp"}), (1e-3, {"warp", "warp+finetune"})):
+        q = RTPredictor.from_blank()
+        q.model.load_state_dict(p.model.state_dict())
+        q.rt_median, q.rt_mad = p.rt_median, p.rt_mad
+        rep = q.calibrate(new, device="cpu", verbose=False, epochs=2, lr=lr)
+        assert rep["mode"] in modes
+        assert "A[+42]" in q.vocab.tokens
+        assert np.isfinite(q.predict(new[mod].head(10), device="cpu")).all()

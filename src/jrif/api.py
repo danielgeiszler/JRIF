@@ -11,8 +11,9 @@
 Calling `.fit(df)` will:
   - discover any modification tokens in the input that the model's vocab does
     not know yet,
-  - extend the embedding tables (inheriting from parent AAs by default;
-    `fresh_mods=[...]` opts new tokens out of inheritance),
+  - log every modification in the data and whether it is new,
+  - extend the embedding tables (a new residue mod starts from its residue's
+    row; a new terminal mod has no parent and is learned from scratch),
   - robust z-score the RT column (median / MAD on the train split),
   - train (Muon for conv weights, AdamW elsewhere; cosine + linear warmup;
     optional early stopping on val R²), and
@@ -27,7 +28,7 @@ import copy
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -41,7 +42,8 @@ from jrif.dataset import (
     Vocabulary,
     discover_tokens,
     fit_rt_scale,
-    strict_filter,
+    mod_census,
+    drop_untokenizable,
     to_polars,
 )
 from jrif.loss import LaplaceUniformMixture, NormalNormalMixture
@@ -130,6 +132,36 @@ def _split_train_val(
     val_seqs = set(seqs[:n_val])
     is_val = df["seq"].is_in(list(val_seqs))
     return df.filter(~is_val), df.filter(is_val)
+
+
+def _log_mods(seqs, vocab: Vocabulary) -> None:
+    """One log block listing every modification spelling in the data, the
+    vocabulary token it resolves to, and whether that token is new."""
+    census = mod_census(seqs, vocab)
+    if not census:
+        print("jrif: no modifications in data", flush=True)
+        return
+    n_new = len({tok for _, _, tok, new, _ in census if new})
+    print(f"jrif: {len(census)} modification(s) in data, {n_new} new:", flush=True)
+    width = max(len(t) for t, *_ in census)
+    for spelling, n, tok, new, parent in census:
+        if tok is None:
+            status = "AMBIGUOUS (matches several model tokens), skipped"
+        else:
+            status = "known" if not new else (
+                f"NEW, initialized from {parent}" if parent else "NEW, learned from scratch")
+            if tok != spelling:
+                status += f" (as {tok})"
+        print(f"  {spelling:<{width}}  {n:>8,} IDs  {status}", flush=True)
+
+
+def _extend_for(model: nn.Module, seqs) -> None:
+    """Add every token in `seqs` the vocabulary lacks. A new residue mod
+    starts from its residue's row; a new terminal mod has no parent and is
+    learned from scratch."""
+    new = discover_tokens(seqs, model.vocab)
+    if new:
+        model.extend_vocab([(t, p, p is None) for t, p in new.items()])
 
 
 def _make_optimizers(
@@ -270,7 +302,6 @@ class RTPredictor:
         seq_col: str = "seq",
         batch_size: int = 2048,
         device: Optional[str] = None,
-        strict: bool = True,
     ) -> np.ndarray:
         device_t = torch.device(
             device if device else _auto_device()
@@ -285,7 +316,6 @@ class RTPredictor:
             df_with_rt, self.vocab,
             seq_col=seq_col, rt_col="__rt__",
             rt_median=self.rt_median, rt_mad=self.rt_mad,
-            strict=strict,
         )
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
@@ -359,10 +389,16 @@ class RTPredictor:
               .filter(pl.col("seq").str.len_chars() > 0)
               .unique(subset=["seq"])
         )
-        df_pl, n_bad, first = strict_filter(df_pl, self.vocab, will_extend=True)
+        df_pl, n_bad, first = drop_untokenizable(df_pl, self.vocab, will_extend=True)
         if n_bad:
             print(f"jrif: skipped {n_bad} ID(s) that could not be tokenized "
                   f"(first: {first})", flush=True)
+        if verbose:
+            _log_mods(df_pl["seq"].to_list(), self.vocab)
+        # New tokens are added before anything is scored, so the frozen-base
+        # rank check and warp see every ID (a new residue mod starts as its
+        # residue) and the base-weight snapshot below matches the model shape.
+        _extend_for(self.model, df_pl["seq"].to_list())
         n = len(df_pl)
         rng = random.Random(seed)
         order = list(range(n)); rng.shuffle(order)
@@ -371,9 +407,7 @@ class RTPredictor:
         y_hold = hold["rt"].to_numpy()
 
         self.rt_warp = None
-        # strict=False: novel mods aren't in the vocab yet (fit extends it);
-        # the rank check wants the bare-residue fallback here.
-        z_hold = self.predict(hold, seq_col="seq", device=device, strict=False)
+        z_hold = self.predict(hold, seq_col="seq", device=device)
         rank = float(spearmanr(y_hold, z_hold).statistic)
         report = {"n": n, "holdout_rank": rank}
 
@@ -387,7 +421,7 @@ class RTPredictor:
             fit_kwargs.setdefault("verbose", verbose)
             self.fit(df_pl, seq_col="seq", rt_col="rt", val_df=hold,
                      device=device, seed=seed, **{**SHIPPING_RECIPE, **fit_kwargs})
-            pred = self.predict(hold, seq_col="seq", device=device, strict=False)
+            pred = self.predict(hold, seq_col="seq", device=device)
             report["holdout_mae"] = float(np.abs(pred - y_hold).mean())
             report["mode"] = "finetune_raw"
             return report
@@ -399,7 +433,7 @@ class RTPredictor:
             return xk, yk
 
         # 1. warp from calibration split; score warp-only on holdout
-        z_cal = self.predict(cal, seq_col="seq", device=device, strict=False)
+        z_cal = self.predict(cal, seq_col="seq", device=device)
         xk, yk = fit_warp(z_cal, cal["rt"].to_numpy())
         warp_hold_mae = float(np.abs(np.interp(z_hold, xk, yk) - y_hold).mean())
 
@@ -416,23 +450,23 @@ class RTPredictor:
                  seq_col="seq", rt_col="rt", val_df=hold_inv,
                  device=device, seed=seed, **{**SHIPPING_RECIPE, **fit_kwargs})
         # refit warp on the fine-tuned model's own outputs
-        z_cal2 = self.predict(cal, seq_col="seq", device=device, strict=False)
+        z_cal2 = self.predict(cal, seq_col="seq", device=device)
         xk2, yk2 = fit_warp(z_cal2, cal["rt"].to_numpy())
-        z_hold2 = self.predict(hold, seq_col="seq", device=device, strict=False)
+        z_hold2 = self.predict(hold, seq_col="seq", device=device)
         ft_hold_mae = float(np.abs(np.interp(z_hold2, xk2, yk2) - y_hold).mean())
 
         report["warp_only_holdout_mae"] = warp_hold_mae
         report["warp_finetune_holdout_mae"] = ft_hold_mae
         if ft_hold_mae <= warp_hold_mae:
             # keep fine-tuned weights; final warp refit on ALL ids
-            z_all = self.predict(df_pl, seq_col="seq", device=device, strict=False)
+            z_all = self.predict(df_pl, seq_col="seq", device=device)
             self.rt_warp = fit_warp(z_all, df_pl["rt"].to_numpy())
             report["mode"] = "warp+finetune"
             report["holdout_mae"] = ft_hold_mae
         else:
             # training hurt (tiny N): restore base weights, warp-only on ALL ids
             self.model.load_state_dict(base_state)
-            z_all = self.predict(df_pl, seq_col="seq", device=device, strict=False)
+            z_all = self.predict(df_pl, seq_col="seq", device=device)
             self.rt_warp = fit_warp(z_all, df_pl["rt"].to_numpy())
             report["mode"] = "warp"
             report["holdout_mae"] = warp_hold_mae
@@ -460,7 +494,7 @@ class RTPredictor:
         novel = set(discover_tokens(df_pl["seq"].to_list(), self.vocab))
         if novel:
             def has_novel(seq: str) -> bool:
-                return any(t in seq for t in novel)
+                return bool(discover_tokens([seq], self.vocab))
             is_novel = df_pl["seq"].map_elements(has_novel, return_dtype=pl.Boolean)
             clean = df_pl.filter(~is_novel)
         else:
@@ -494,7 +528,7 @@ class RTPredictor:
         self.fit(df_pl.with_columns(pl.Series("rt", inv_targets)),
                  seq_col="seq", rt_col="rt", device=device, seed=seed,
                  **{**SHIPPING_RECIPE, **fit_kwargs})
-        z_all = self.predict(df_pl, seq_col="seq", device=device, strict=False)
+        z_all = self.predict(df_pl, seq_col="seq", device=device)
         iso = IsotonicRegression(out_of_bounds="clip").fit(z_all, df_pl["rt"].to_numpy())
         self.rt_warp = (np.asarray(iso.X_thresholds_, float),
                         np.asarray(iso.y_thresholds_, float))
@@ -521,7 +555,6 @@ class RTPredictor:
         batch_size: Union[int, str] = 128,
         warmup_epochs: int = 3,
         weight_decay: float = 1e-4,
-        fresh_mods: Sequence[str] = (),
         seed: int = 42,
         device: Optional[str] = None,
         num_threads: Optional[int] = None,
@@ -602,8 +635,8 @@ class RTPredictor:
         else:
             train_pl, val_pl = _split_train_val(df_pl, val_fraction=val_fraction, seed=seed)
 
-        train_pl, n_bad_tr, first = strict_filter(train_pl, self.vocab, will_extend=True)
-        val_pl, n_bad_va, first_va = strict_filter(val_pl, self.vocab, will_extend=True)
+        train_pl, n_bad_tr, first = drop_untokenizable(train_pl, self.vocab, will_extend=True)
+        val_pl, n_bad_va, first_va = drop_untokenizable(val_pl, self.vocab, will_extend=True)
         if n_bad_tr + n_bad_va:
             print(f"jrif: skipped {n_bad_tr + n_bad_va} ID(s) that could not "
                   f"be tokenized (first: {first or first_va})", flush=True)
@@ -612,14 +645,9 @@ class RTPredictor:
 
         # 2. Discover unknown tokens against current vocab and extend the model
         all_seqs = pl.concat([train_pl, val_pl])["seq"].to_list()
-        fresh_set = set(fresh_mods)
-        new_tokens = [(token, parent, token in fresh_set)
-                      for token, parent in discover_tokens(all_seqs, self.vocab).items()]
-        if new_tokens:
-            if verbose:
-                print(f"  Discovered {len(new_tokens)} new token(s): "
-                      f"{[t for t, _, _ in new_tokens]}")
-            self.model.extend_vocab(new_tokens)
+        if verbose:
+            _log_mods(all_seqs, self.vocab)
+        _extend_for(self.model, all_seqs)
 
         # 3. Fit RT scale on TRAIN only; build datasets
         train_rts = train_pl["rt"].to_numpy().astype("float32")

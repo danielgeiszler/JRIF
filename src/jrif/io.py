@@ -29,17 +29,19 @@ def detect_format(columns) -> str:
 
 
 def apply_psmtag(seq: str) -> str:
-    """Annotate a plain modified-peptide string with PSMtag: prepend
-    `.[308.1161]` and tag every K not already bracket-modified."""
+    """Annotate a plain modified-peptide string with PSMtag: prepend the
+    N-terminal tag `n[+308.1161]` unless the N-terminus is already modified,
+    and tag every K not already modified."""
     if not isinstance(seq, str) or not seq:
         return seq
-    tagged = seq if seq.startswith(".[") else ".[308.1161]" + seq
+    nterm_modified = seq.startswith((".[", "n[", "[", "("))
+    tagged = seq if nterm_modified else "n[+308.1161]" + seq
     out: list[str] = []
     i = 0
     while i < len(tagged):
         out.append(tagged[i])
-        if tagged[i] == "K" and not (i + 1 < len(tagged) and tagged[i + 1] == "["):
-            out.append("[308.1161]")
+        if tagged[i] == "K" and not (i + 1 < len(tagged) and tagged[i + 1] in "[("):
+            out.append("[+308.1161]")
         i += 1
     return "".join(out)
 

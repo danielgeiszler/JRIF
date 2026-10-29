@@ -50,9 +50,12 @@ m.calibrate(ids)                                # columns: seq, charge, im
 lib["pred_im"] = m.predict(lib)                 # columns: seq, charge
 ```
 
-Sequence format: plain residues, modifications as `X[mass]` (`C[160]`,
-`M[147]`, `K[308]`), N-terminal modifications as a leading `.[308]`.
-UniMod notation is also accepted.
+Sequence format: residues, with modifications as delta masses
+(`S[+79.9663]`, `C[+57.0215]`) or UniMod (`S(UniMod:21)`). N-terminal
+modifications are a leading `n[+mass]`, C-terminal ones a trailing `c[+mass]`.
+A bare `C` is unmodified cysteine. Masses match at the precision you write
+them, so `S[80]` uses the model's `S[+79.9663]`. The older spellings
+`C[160]`, `M[147]`, `K[308]` and `.[308]` are also accepted.
 
 Modifications the model has never seen (e.g. `S[80]`) don't need any setup:
 `calibrate()` adds new tokens to the vocabulary and learns them from your
