@@ -19,7 +19,7 @@ from sklearn.model_selection import train_test_split
 def load_spectral_library(
     path: str | Path,
     seed: int = 42,
-    split_dir: str | Path = "splits",
+    split_dir: str | Path | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """spectral-library TSV. Group by ModifiedPeptide / PeptideSequence, average
     Tr_recalibrated, split 80/10/10 at the peptide level. Output column names:
@@ -44,7 +44,7 @@ def load_spectral_library(
 def load_report_lib_parquet(
     path: str | Path,
     seed: int = 42,
-    split_dir: str | Path = "splits_psmtag",
+    split_dir: str | Path | None = None,
     max_q_value: float = 0.01,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """search-engine report-library parquet. Drops decoys, filters to Q.Value <=
@@ -69,10 +69,41 @@ def load_report_lib_parquet(
     return _peptide_split(df, seed, split_dir)
 
 
+def load_report_lib_parquet_im(
+    path: str | Path,
+    seed: int = 42,
+    split_dir: str | Path | None = None,
+    max_q_value: float = 0.01,
+) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Report-library parquet for IM: same filtering and canonicalization as
+    load_report_lib_parquet, IM averaged per (modified sequence, charge).
+    Split is at the peptide level so no peptide's charge states straddle
+    splits. Output columns: `seq`, `charge`, `im`."""
+    df = pl.read_parquet(
+        path, columns=["Modified.Sequence", "Precursor.Charge", "IM", "Decoy", "Q.Value"],
+        use_pyarrow=True,
+    )
+    df = (
+        df.filter((pl.col("Decoy") == 0) & (pl.col("Q.Value") <= max_q_value))
+          .group_by(["Modified.Sequence", "Precursor.Charge"])
+          .agg(pl.col("IM").mean().alias("im"))
+          .with_columns(
+              pl.col("Modified.Sequence")
+                .str.replace(r"^\(tag\)", ".[308]")
+                .str.replace_all(r"\(tag\)", "[308]")
+                .str.replace_all(r"\(UniMod:4\)", "[160]")
+                .str.replace_all(r"\(UniMod:35\)", "[147]")
+                .alias("seq"),
+              pl.col("Precursor.Charge").cast(pl.Int64).alias("charge"))
+          .select(["seq", "charge", "im"])
+    )
+    return _peptide_split(df, seed, split_dir)
+
+
 def load_psmtag_library(
     path: str | Path,
     seed: int = 42,
-    split_dir: str | Path = "splits_psmtag",
+    split_dir: str | Path | None = None,
     exclude_oxm: bool = False,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """FragPipe PSMtag library TSV. Output columns: `seq`, `rt`."""
@@ -92,16 +123,26 @@ def load_psmtag_library(
     return _peptide_split(df, seed, split_dir)
 
 
+def write_peptide_splits(
+    split_dir: str | Path,
+    train_df: pl.DataFrame, val_df: pl.DataFrame, test_df: pl.DataFrame,
+) -> None:
+    """Write `{train,val,test}_peptides.tsv` (one `seq` column, sorted) to
+    `split_dir` so a split can be reproduced or audited later."""
+    sp = Path(split_dir); sp.mkdir(parents=True, exist_ok=True)
+    for name, d in [("train", train_df), ("val", val_df), ("test", test_df)]:
+        d.select(pl.col("seq").unique().sort()).write_csv(
+            sp / f"{name}_peptides.tsv", separator="\t")
+
+
 def _peptide_split(
-    df: pl.DataFrame, seed: int, split_dir: str | Path,
+    df: pl.DataFrame, seed: int, split_dir: str | Path | None,
 ) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    """Peptide-level 80/10/10 split. Pure unless `split_dir` is given, in which
+    case the peptide lists are also written there (see write_peptide_splits)."""
     seqs = np.sort(df["seq"].unique().to_numpy())
     train_pep, temp_pep = train_test_split(seqs, test_size=0.2, random_state=seed)
     val_pep, test_pep = train_test_split(temp_pep, test_size=0.5, random_state=seed)
-
-    sp = Path(split_dir); sp.mkdir(parents=True, exist_ok=True)
-    for name, peps in [("train", train_pep), ("val", val_pep), ("test", test_pep)]:
-        pl.DataFrame({"seq": peps}).write_csv(sp / f"{name}_peptides.tsv", separator="\t")
 
     train_pep_set = set(train_pep.tolist())
     val_pep_set = set(val_pep.tolist())
@@ -109,6 +150,8 @@ def _peptide_split(
     train_df = df.filter(pl.col("seq").is_in(list(train_pep_set)))
     val_df = df.filter(pl.col("seq").is_in(list(val_pep_set)))
     test_df = df.filter(pl.col("seq").is_in(list(test_pep_set)))
+    if split_dir is not None:
+        write_peptide_splits(split_dir, train_df, val_df, test_df)
     return train_df, val_df, test_df
 
 

@@ -50,7 +50,7 @@ def test_im_checkpoint_kind_guard(tmp_path):
     path = tmp_path / "im.pt"
     p.save(path)
     from jrif.api import RTPredictor
-    rt = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    rt = RTPredictor.from_blank()
     rt_path = tmp_path / "rt.pt"
     rt.save(rt_path)
     with pytest.raises(ValueError):

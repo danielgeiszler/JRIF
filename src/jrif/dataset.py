@@ -1,10 +1,13 @@
 """Tokenization, vocabulary, and library loaders for JRIF.
 
-The Vocabulary object owns the token-id mapping for the main residue alphabet
-plus N-term / C-term peptide-level modification mappings. It is *runtime
-extensible*: when fine-tuning on a dataset that contains modification tokens
-the base model has not seen, Vocabulary.extend() / extend_nterm_mod() grow the
-maps and RTModel.extend_vocab grows the embedding tables to match.
+The Vocabulary object owns the token-id mapping: residues, modified residues,
+and terminus tokens. Every peptide is tokenized with a terminus token at both
+ends — its N-terminal mod (e.g. `.[308]`) or `<nterm>` at position 0, and
+`<cterm>` after the last residue — so the token sequence is the single place
+termini are represented. The vocabulary is *runtime extensible*: when
+fine-tuning on data containing tokens the base model has not seen,
+Vocabulary.extend() grows the map and RTModel.extend_vocab grows the embedding
+tables to match.
 
 Token canonicalization rules:
 - Bracket-mass tokens are normalized to integer mass: 'K[308.1161]' -> 'K[308]'.
@@ -38,14 +41,14 @@ DEFAULT_TOKENS: dict[str, int] = {
     "M[147]": 21,
     "C[160]": 22,
     "K[308]": 23,
+    # Free termini. An N-terminal mod token replaces <nterm>; a future
+    # C-terminal mod token would replace <cterm> the same way.
+    "<nterm>": 24,
+    "<cterm>": 25,
 }
 
-DEFAULT_NTERM_MOD_TOKENS: dict[str, int] = {
-    "": 0,
-    ".[308]": 1,
-}
-
-DEFAULT_CTERM_MOD_TOKENS: dict[str, int] = {"": 0}
+FREE_NTERM = "<nterm>"
+FREE_CTERM = "<cterm>"
 
 DEFAULT_PARENT_OF: dict[str, str] = {
     "M[147]": "M",
@@ -74,8 +77,6 @@ _PSMTAG_PATTERN = re.compile(
 class Vocabulary:
     """Token-id maps + lineage tracking. Mutate via extend* methods."""
     tokens: dict[str, int]
-    nterm_mod_tokens: dict[str, int]
-    cterm_mod_tokens: dict[str, int]
     parent_of: dict[str, str] = field(default_factory=dict)
     fresh: set[str] = field(default_factory=set)
 
@@ -83,8 +84,6 @@ class Vocabulary:
     def default(cls) -> "Vocabulary":
         return cls(
             tokens=dict(DEFAULT_TOKENS),
-            nterm_mod_tokens=dict(DEFAULT_NTERM_MOD_TOKENS),
-            cterm_mod_tokens=dict(DEFAULT_CTERM_MOD_TOKENS),
             parent_of=dict(DEFAULT_PARENT_OF),
             fresh=set(DEFAULT_FRESH),
         )
@@ -92,14 +91,6 @@ class Vocabulary:
     @property
     def size(self) -> int:
         return len(self.tokens)
-
-    @property
-    def nterm_size(self) -> int:
-        return len(self.nterm_mod_tokens)
-
-    @property
-    def cterm_size(self) -> int:
-        return len(self.cterm_mod_tokens)
 
     def has(self, token: str) -> bool:
         return token in self.tokens
@@ -115,20 +106,6 @@ class Vocabulary:
             self.fresh.add(token)
         return new_id
 
-    def extend_nterm_mod(self, mod: str) -> int:
-        if mod in self.nterm_mod_tokens:
-            return self.nterm_mod_tokens[mod]
-        new_id = len(self.nterm_mod_tokens)
-        self.nterm_mod_tokens[mod] = new_id
-        return new_id
-
-    def extend_cterm_mod(self, mod: str) -> int:
-        if mod in self.cterm_mod_tokens:
-            return self.cterm_mod_tokens[mod]
-        new_id = len(self.cterm_mod_tokens)
-        self.cterm_mod_tokens[mod] = new_id
-        return new_id
-
     def parent_id(self, token: str) -> Optional[int]:
         parent = self.parent_of.get(token)
         if parent is None:
@@ -138,8 +115,6 @@ class Vocabulary:
     def to_dict(self) -> dict:
         return {
             "tokens": dict(self.tokens),
-            "nterm_mod_tokens": dict(self.nterm_mod_tokens),
-            "cterm_mod_tokens": dict(self.cterm_mod_tokens),
             "parent_of": dict(self.parent_of),
             "fresh": sorted(self.fresh),
         }
@@ -148,8 +123,6 @@ class Vocabulary:
     def from_dict(cls, d: dict) -> "Vocabulary":
         return cls(
             tokens=dict(d["tokens"]),
-            nterm_mod_tokens=dict(d["nterm_mod_tokens"]),
-            cterm_mod_tokens=dict(d["cterm_mod_tokens"]),
             parent_of=dict(d.get("parent_of", {})),
             fresh=set(d.get("fresh", [])),
         )
@@ -209,76 +182,81 @@ def _resolve_main(aa: Optional[str], full: str, fmt: str) -> Optional[str]:
     return aa
 
 
+class TokenizationError(ValueError):
+    """A sequence could not be tokenized faithfully (unknown token/residue,
+    malformed input, or truncation). Raised only in strict mode."""
+
+
 def _pad(tokens: list[int]) -> list[int]:
     if len(tokens) >= MAX_LEN:
         return tokens[:MAX_LEN]
     return tokens + [0] * (MAX_LEN - len(tokens))
 
 
-def tokenize(
-    seq: str, vocab: Vocabulary, *, terminal_in_seq: bool = False,
-) -> tuple[list[int], int, int]:
+def tokenize(seq: str, vocab: Vocabulary, *, strict: bool = False) -> list[int]:
     """Tokenize one peptide sequence with the given Vocabulary.
 
-    Returns (token_ids[MAX_LEN], nterm_mod_id, cterm_mod_id). Tokens not in
-    `vocab` fall back to the bare AA id when possible, otherwise are dropped.
+    Returns token_ids[MAX_LEN]: N-terminus token (mod or <nterm>), residues,
+    <cterm>, then padding. Tokens not in `vocab` fall back to the bare AA id
+    when possible, otherwise are dropped.
 
-    terminal_in_seq: unified-termini mode — the N-term mod is emitted as a
-    main-vocab token at position 0 instead of a separate nterm_mod_id, so the
-    sequence tensor is the single place termini are represented.
+    strict: raise TokenizationError instead of silently degrading — on
+    non-string/empty input, unknown modifications (including fallback to the
+    bare residue), unknown residues, unknown terminal mods, and sequences
+    longer than MAX_LEN.
     """
     if not isinstance(seq, str) or not seq:
-        return _pad([]), 0, 0
+        if strict:
+            raise TokenizationError(f"empty or non-string sequence: {seq!r}")
+        return _pad([])
     body, nterm_mod = _strip_nterm(seq)
     fmt = _detect_format(seq)
     out: list[int] = []
-    if terminal_in_seq:
-        nterm_id = 0
-        if nterm_mod:
-            idx = vocab.tokens.get(nterm_mod)
-            if idx is not None:
-                out.append(idx)
+    if nterm_mod:
+        idx = vocab.tokens.get(nterm_mod)
+        if idx is not None:
+            out.append(idx)
+        elif strict:
+            raise TokenizationError(
+                f"unknown N-terminal mod {nterm_mod!r} in {seq!r}")
     else:
-        nterm_id = vocab.nterm_mod_tokens.get(nterm_mod, 0) if nterm_mod else 0
+        out.append(vocab.tokens[FREE_NTERM])
     for m in _iter_main_matches(body, fmt):
         aa = next((g for g in m.groups() if g), None)
         token = _resolve_main(aa, m.group(0), fmt)
         if token is None:
+            if strict:
+                raise TokenizationError(
+                    f"unparseable token {m.group(0)!r} in {seq!r}")
             continue
         idx = vocab.tokens.get(token)
+        if idx is None and strict:
+            raise TokenizationError(f"unknown token {token!r} in {seq!r}")
         if idx is None and aa in vocab.tokens:
             idx = vocab.tokens[aa]
         if idx is None:
             continue
         out.append(idx)
-    return _pad(out), nterm_id, 0
+    out.append(vocab.tokens[FREE_CTERM])
+    if strict and len(out) > MAX_LEN:
+        raise TokenizationError(
+            f"sequence longer than MAX_LEN={MAX_LEN} ({len(out)} tokens): {seq!r}")
+    return _pad(out)
 
 
 def discover_tokens(
-    seqs: Iterable[str], vocab: Vocabulary, *, terminal_in_seq: bool = False,
-) -> tuple[dict[str, Optional[str]], set[str]]:
-    """Walk sequences and return tokens not yet present in `vocab`.
-
-    Returns:
-      (new_main_tokens, new_nterm_mods)
-      where new_main_tokens maps each unknown token to its inferred parent AA
-      (the bare residue letter for X[NNN]-form tokens; None otherwise).
-
-    terminal_in_seq: unknown N-term mods are reported as main tokens (parent
-    None) rather than as separate nterm mods; new_nterm_mods stays empty.
-    """
+    seqs: Iterable[str], vocab: Vocabulary,
+) -> dict[str, Optional[str]]:
+    """Walk sequences and return tokens not yet present in `vocab`, mapped to
+    their inferred parent AA (the bare residue letter for X[NNN]-form tokens;
+    None otherwise, including N-terminal mods)."""
     new_main: dict[str, Optional[str]] = {}
-    new_nterm: set[str] = set()
     for seq in seqs:
         if not isinstance(seq, str) or not seq:
             continue
         body, nterm_mod = _strip_nterm(seq)
-        if nterm_mod:
-            if terminal_in_seq:
-                if nterm_mod not in vocab.tokens:
-                    new_main[nterm_mod] = None
-            elif nterm_mod not in vocab.nterm_mod_tokens:
-                new_nterm.add(nterm_mod)
+        if nterm_mod and nterm_mod not in vocab.tokens:
+            new_main[nterm_mod] = None
         fmt = _detect_format(seq)
         for m in _iter_main_matches(body, fmt):
             aa = next((g for g in m.groups() if g), None)
@@ -287,7 +265,42 @@ def discover_tokens(
                 continue
             parent = aa if aa and aa in vocab.tokens else None
             new_main[token] = parent
-    return new_main, new_nterm
+    return new_main
+
+
+def strict_filter(
+    df: pl.DataFrame, vocab: Vocabulary, *, seq_col: str = "seq",
+    will_extend: bool = False,
+) -> tuple[pl.DataFrame, int, Optional[str]]:
+    """Drop rows whose sequence fails strict tokenization.
+
+    Returns (filtered_df, n_dropped, first_failure_message). When
+    `will_extend` is set, tokens that `discover_tokens` would report are
+    treated as known — the caller is about to extend the vocabulary with
+    them — so only genuinely untokenizable rows (unparseable characters,
+    over-MAX_LEN sequences, ...) are dropped.
+    """
+    seqs = df[seq_col].to_list()
+    check_vocab = vocab
+    if will_extend:
+        new_main = discover_tokens(seqs, vocab)
+        if new_main:
+            check_vocab = Vocabulary(tokens=dict(vocab.tokens))
+            for t in new_main:
+                check_vocab.extend(t, None)
+    keep = np.ones(len(seqs), dtype=bool)
+    first: Optional[str] = None
+    for i, s in enumerate(seqs):
+        try:
+            tokenize(s, check_vocab, strict=True)
+        except TokenizationError as e:
+            keep[i] = False
+            if first is None:
+                first = str(e)
+    n_bad = int((~keep).sum())
+    if n_bad:
+        df = df.filter(pl.Series(keep))
+    return df, n_bad, first
 
 
 # -------- DataFrame helpers --------
@@ -310,9 +323,9 @@ def fit_rt_scale(rts: np.ndarray) -> tuple[float, float]:
 
 
 class RTDataset(Dataset):
-    """Tokenized peptides + z-scored RT targets + terminal mod ids.
+    """Tokenized peptides + z-scored RT targets.
 
-    __getitem__ returns (tokens, nterm_mod_id, cterm_mod_id, target). The
+    __getitem__ returns (tokens, target). The
     target is z-scored against (rt_median, rt_mad); pass the TRAIN scale when
     building val/test/predict datasets.
 
@@ -328,24 +341,16 @@ class RTDataset(Dataset):
         rt_col: Optional[str] = "rt",
         rt_median: Optional[float] = None,
         rt_mad: Optional[float] = None,
-        terminal_in_seq: bool = False,
+        strict: bool = False,
     ):
         df = to_polars(df)
         seqs = df[seq_col].to_list()
         n = len(seqs)
 
         tok_arr = np.zeros((n, MAX_LEN), dtype=np.int64)
-        nterm_arr = np.zeros(n, dtype=np.int64)
-        cterm_arr = np.zeros(n, dtype=np.int64)
         for i, s in enumerate(seqs):
-            t, ni, ci = tokenize(s, vocab, terminal_in_seq=terminal_in_seq)
-            tok_arr[i, :] = t
-            nterm_arr[i] = ni
-            cterm_arr[i] = ci
-
+            tok_arr[i, :] = tokenize(s, vocab, strict=strict)
         self.sequences = torch.from_numpy(tok_arr)
-        self.nterm_mod_ids = torch.from_numpy(nterm_arr)
-        self.cterm_mod_ids = torch.from_numpy(cterm_arr)
 
         if rt_col is None:
             self.rt_median = float(rt_median if rt_median is not None else 0.0)
@@ -363,9 +368,4 @@ class RTDataset(Dataset):
         return len(self.targets)
 
     def __getitem__(self, idx: int):
-        return (
-            self.sequences[idx],
-            self.nterm_mod_ids[idx],
-            self.cterm_mod_ids[idx],
-            self.targets[idx],
-        )
+        return self.sequences[idx], self.targets[idx]

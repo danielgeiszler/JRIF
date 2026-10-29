@@ -7,7 +7,7 @@ Charge placement was benchmarked (results/q21_im_charge_s0.json, reinj 1/K0,
 scalar cannot model the charge x sequence interaction that dominates higher
 charge states (z=4 MAE: 0.020 input vs 0.090 head).
 
-Everything else mirrors the RT stack: unified-termini tokenization, robust-z
+Everything else mirrors the RT stack: terminus-token tokenization, robust-z
 targets, mixture loss, Muon+AdamW, cosine + warmup, val-MAE selection.
 """
 
@@ -25,15 +25,18 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 from jrif.api import (
+    CHECKPOINT_FORMAT_VERSION,
     SCRATCH_LR,
     SHIPPING_RECIPE,
     DataFrameLike,
     FitResult,
     _auto_device,
+    _load_checkpoint_dict,
     _make_optimizers,
     _seed_everything,
 )
-from jrif.dataset import MAX_LEN, Vocabulary, discover_tokens, fit_rt_scale, to_polars, tokenize
+from jrif.dataset import (MAX_LEN, Vocabulary, discover_tokens, fit_rt_scale,
+                          strict_filter, to_polars, tokenize)
 from jrif.loss import LaplaceUniformMixture
 from jrif.model import RTModel, DilatedBlock
 
@@ -46,7 +49,7 @@ class IMModel(RTModel):
     """
 
     def __init__(self, vocab: Vocabulary, embedding_dim: int = 16):
-        super().__init__(vocab, embedding_dim=embedding_dim, unified_termini=True)
+        super().__init__(vocab, embedding_dim=embedding_dim)
         conv_in = 12 + embedding_dim + 1
         chans, dils = [64, 64, 128, 128, 128], [1, 2, 4, 8, 16]
         blocks, prev = [], conv_in
@@ -86,14 +89,14 @@ class IMDataset(Dataset):
     """Tokenized peptides + centered charge + z-scored IM targets."""
 
     def __init__(self, df, vocab: Vocabulary, *, seq_col="seq", charge_col="charge",
-                 im_col: Optional[str] = "im", im_median=None, im_mad=None):
+                 im_col: Optional[str] = "im", im_median=None, im_mad=None,
+                 strict: bool = False):
         df = to_polars(df)
         seqs = df[seq_col].to_list()
         n = len(seqs)
         tok = np.zeros((n, MAX_LEN), dtype=np.int64)
         for i, s in enumerate(seqs):
-            t, _, _ = tokenize(s, vocab, terminal_in_seq=True)
-            tok[i, :] = t
+            tok[i, :] = tokenize(s, vocab, strict=strict)
         self.sequences = torch.from_numpy(tok)
         self.charges = torch.from_numpy(
             df[charge_col].to_numpy().astype(np.float32) - 2.0)
@@ -135,27 +138,25 @@ class IMPredictor:
         return cls(IMModel(Vocabulary.default(), embedding_dim))
 
     @classmethod
-    def from_checkpoint(cls, path: Union[str, Path]) -> "IMPredictor":
-        try:
-            ckpt = torch.load(Path(path), map_location="cpu", weights_only=True)
-        except Exception:
-            ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
-        if ckpt.get("kind") != "im":
-            raise ValueError(f"{path} is not an IM checkpoint")
-        vocab = Vocabulary.from_dict(ckpt["vocab"])
-        model = IMModel(vocab, int(ckpt.get("embedding_dim", 16)))
+    def from_checkpoint(
+        cls, path: Union[str, Path], *, device: Optional[str] = None,
+    ) -> "IMPredictor":
+        ckpt = _load_checkpoint_dict(Path(path), "im")
+        model = IMModel(Vocabulary.from_dict(ckpt["vocab"]), int(ckpt["embedding_dim"]))
         model.load_state_dict(ckpt["model_state_dict"])
-        pred = cls(model, ckpt.get("im_median", 0.0), ckpt.get("im_mad", 1.0))
+        pred = cls(model, ckpt["im_median"], ckpt["im_mad"])
         warp = ckpt.get("im_warp")
         if warp is not None:
             pred.im_warp = (np.asarray(warp[0], float), np.asarray(warp[1], float))
+        if device is not None:
+            pred.model.to(device)
         return pred
 
     def save(self, path: Union[str, Path]) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
-            "format_version": 2, "kind": "im",
+            "format_version": CHECKPOINT_FORMAT_VERSION, "kind": "im",
             "model_state_dict": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             "vocab": self.vocab.to_dict(),
             "embedding_dim": self.model.embedding_dim,
@@ -165,11 +166,13 @@ class IMPredictor:
         }, path)
 
     def predict(self, df: DataFrameLike, *, seq_col="seq", charge_col="charge",
-                batch_size: int = 2048, device: Optional[str] = None) -> np.ndarray:
+                batch_size: int = 2048, device: Optional[str] = None,
+                strict: bool = True) -> np.ndarray:
         device_t = torch.device(device if device else _auto_device())
         self.model.to(device_t).eval()
         ds = IMDataset(to_polars(df), self.vocab, seq_col=seq_col, charge_col=charge_col,
-                       im_col=None, im_median=self.im_median, im_mad=self.im_mad)
+                       im_col=None, im_median=self.im_median, im_mad=self.im_mad,
+                       strict=strict)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
         preds = []
         with torch.inference_mode():
@@ -199,6 +202,11 @@ class IMPredictor:
                           pl.col(charge_col).cast(pl.Float64).alias("charge"),
                           pl.col(im_col).cast(pl.Float64).alias("im")])
                  .drop_nulls().unique(subset=["seq", "charge"]))
+        df_pl, n_bad, first = strict_filter(
+            df_pl, self.vocab, will_extend=True)
+        if n_bad:
+            print(f"jrif: skipped {n_bad} ID(s) that could not be tokenized "
+                  f"(first: {first})", flush=True)
         n = len(df_pl)
         rng = random.Random(seed)
         order = list(range(n)); rng.shuffle(order)
@@ -207,7 +215,9 @@ class IMPredictor:
         y_hold = hold["im"].to_numpy()
 
         self.im_warp = None
-        z_hold = self.predict(hold, device=device)
+        # strict=False: novel mods aren't in the vocab yet (fit extends it);
+        # the rank check wants the bare-residue fallback here.
+        z_hold = self.predict(hold, device=device, strict=False)
         rank = float(spearmanr(y_hold, z_hold).statistic)
         report = {"n": n, "holdout_rank": rank}
 
@@ -218,7 +228,7 @@ class IMPredictor:
             fit_kwargs.setdefault("verbose", verbose)
             self.fit(df_pl, val_df=hold, device=device, seed=seed, **fit_kwargs)
             report["holdout_mae"] = float(np.abs(
-                self.predict(hold, device=device) - y_hold).mean())
+                self.predict(hold, device=device, strict=False) - y_hold).mean())
             report["mode"] = "finetune_raw"
             return report
 
@@ -227,7 +237,7 @@ class IMPredictor:
             return (np.asarray(iso.X_thresholds_, float),
                     np.asarray(iso.y_thresholds_, float))
 
-        z_cal = self.predict(cal, device=device)
+        z_cal = self.predict(cal, device=device, strict=False)
         xk, yk = fit_warp(z_cal, cal["im"].to_numpy())
         warp_hold_mae = float(np.abs(np.interp(z_hold, xk, yk) - y_hold).mean())
 
@@ -240,20 +250,20 @@ class IMPredictor:
                  val_df=hold.with_columns(pl.Series("im", np.interp(
                      y_hold, inv_x, inv_y))),
                  device=device, seed=seed, **fit_kwargs)
-        z_cal2 = self.predict(cal, device=device)
+        z_cal2 = self.predict(cal, device=device, strict=False)
         xk2, yk2 = fit_warp(z_cal2, cal["im"].to_numpy())
-        z_hold2 = self.predict(hold, device=device)
+        z_hold2 = self.predict(hold, device=device, strict=False)
         ft_hold_mae = float(np.abs(np.interp(z_hold2, xk2, yk2) - y_hold).mean())
 
         report["warp_only_holdout_mae"] = warp_hold_mae
         report["warp_finetune_holdout_mae"] = ft_hold_mae
         if ft_hold_mae <= warp_hold_mae:
-            z_all = self.predict(df_pl, device=device)
+            z_all = self.predict(df_pl, device=device, strict=False)
             self.im_warp = fit_warp(z_all, df_pl["im"].to_numpy())
             report["mode"] = "warp+finetune"; report["holdout_mae"] = ft_hold_mae
         else:
             self.model.load_state_dict(base_state)
-            z_all = self.predict(df_pl, device=device)
+            z_all = self.predict(df_pl, device=device, strict=False)
             self.im_warp = fit_warp(z_all, df_pl["im"].to_numpy())
             report["mode"] = "warp"; report["holdout_mae"] = warp_hold_mae
         if verbose:
@@ -290,11 +300,16 @@ class IMPredictor:
             is_val = df_pl["seq"].is_in(list(val_seqs))
             train_pl, val_pl = df_pl.filter(~is_val), df_pl.filter(is_val)
 
-        new_main, _ = discover_tokens(train_pl["seq"].to_list() + val_pl["seq"].to_list(),
-                                      self.vocab, terminal_in_seq=True)
-        if new_main:
-            self.model.extend_vocab(
-                new_main_tokens=[(t, p, p is None) for t, p in new_main.items()])
+        train_pl, n_bad_tr, first = strict_filter(train_pl, self.vocab, will_extend=True)
+        val_pl, n_bad_va, first_va = strict_filter(val_pl, self.vocab, will_extend=True)
+        if n_bad_tr + n_bad_va:
+            print(f"jrif: skipped {n_bad_tr + n_bad_va} ID(s) that could not "
+                  f"be tokenized (first: {first or first_va})", flush=True)
+
+        new_tokens = discover_tokens(train_pl["seq"].to_list() + val_pl["seq"].to_list(),
+                                     self.vocab)
+        if new_tokens:
+            self.model.extend_vocab([(t, p, p is None) for t, p in new_tokens.items()])
 
         med, mad = fit_rt_scale(train_pl["im"].to_numpy().astype("float32"))
         self.im_median, self.im_mad = med, mad

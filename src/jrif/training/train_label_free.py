@@ -32,12 +32,15 @@ def main():
     p.add_argument("--checkpoint-dir", default="checkpoints/label_free")
     p.add_argument("--device", default=None, help="cuda / mps / cpu (default: auto)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--split-dir", default="splits",
+                   help="where to write the train/val/test peptide lists")
     args = p.parse_args()
 
-    train_df, val_df, test_df = load_spectral_library(args.data_path, seed=args.seed)
+    train_df, val_df, test_df = load_spectral_library(
+        args.data_path, seed=args.seed, split_dir=args.split_dir)
     print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
-    predictor = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    predictor = RTPredictor.from_blank()
     result = predictor.fit(
         train_df, seq_col="seq", rt_col="rt", val_df=val_df,
         lr=SCRATCH_LR, seed=args.seed, device=args.device,

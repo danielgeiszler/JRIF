@@ -25,12 +25,16 @@ def main():
     p.add_argument("--checkpoint-dir", default="checkpoints/psmtag")
     p.add_argument("--device", default=None, help="cuda / mps / cpu (default: auto)")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--split-dir", default="splits_psmtag",
+                   help="where to write the train/val/test peptide lists")
     args = p.parse_args()
 
     if str(args.data_path).endswith(".parquet"):
-        train_df, val_df, test_df = load_report_lib_parquet(args.data_path, seed=args.seed)
+        train_df, val_df, test_df = load_report_lib_parquet(
+            args.data_path, seed=args.seed, split_dir=args.split_dir)
     else:
-        train_df, val_df, test_df = load_psmtag_library(args.data_path, seed=args.seed)
+        train_df, val_df, test_df = load_psmtag_library(
+            args.data_path, seed=args.seed, split_dir=args.split_dir)
     print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
 
     if args.base_checkpoint:
@@ -38,7 +42,7 @@ def main():
         predictor = RTPredictor.from_checkpoint(args.base_checkpoint)
         lr = FINETUNE_LR
     else:
-        predictor = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+        predictor = RTPredictor.from_blank()
         lr = SCRATCH_LR
 
     result = predictor.fit(

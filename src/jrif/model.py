@@ -8,14 +8,14 @@ the parent residue's row (or zero, for tokens flagged as `fresh` because their
 chemistry diverges too far — K[308]'s side-chain tag is the canonical example).
 
 Architecture overview:
-  Token indices -> [physicochemical features (12) + learned embedding (D)]
+  Token indices (termini included as tokens, see dataset.py)
+    -> [physicochemical features (12) + learned embedding (D)]
     -> 5 dilated Conv1d blocks (k=3; dilations 1,2,4,8,16; GELU + BN)
     -> masked GAP -> [128 ch]
   Head input concatenates:
-    GAP (128) + n_term_emb (4) + c_term_emb (4) + n_mod (4) + c_mod (4)
-    + GRAVY (1) + net charge @ pH 2.7 (1) + frac aromatic (1)
-    + normalized seq length (1) + frac hydrophobic (1) = 149 dims
-  FC head: Dropout(0.3) -> Linear(149, 128) -> GELU -> Dropout(0.2) -> Linear(128, 1)
+    GAP (128) + GRAVY (1) + net charge @ pH 2.7 (1) + frac aromatic (1)
+    + normalized seq length (1) + frac hydrophobic (1) = 133 dims
+  FC head: Dropout(0.3) -> Linear(133, 128) -> GELU -> Dropout(0.2) -> Linear(128, 1)
 """
 
 from __future__ import annotations
@@ -181,21 +181,14 @@ class RTModel(nn.Module):
     """Dilated-CNN retention-time model. Sized from a Vocabulary; grow at
     runtime via `extend_vocab`."""
 
-    def __init__(self, vocab: Vocabulary, embedding_dim: int = 16,
-                 unified_termini: bool = False):
+    def __init__(self, vocab: Vocabulary, embedding_dim: int = 16):
         super().__init__()
         self.vocab = vocab
         self.embedding_dim = embedding_dim
-        self.unified_termini = unified_termini
 
         self._register_lookup_buffers(vocab)
 
         self.embedding = nn.Embedding(vocab.size, embedding_dim, padding_idx=0)
-        if not unified_termini:
-            self.n_term_embedding = nn.Embedding(vocab.size, 4, padding_idx=0)
-            self.c_term_embedding = nn.Embedding(vocab.size, 4, padding_idx=0)
-            self.nterm_mod_embedding = nn.Embedding(max(vocab.nterm_size, 1), 4)
-            self.cterm_mod_embedding = nn.Embedding(max(vocab.cterm_size, 1), 4)
 
         conv_in = 12 + embedding_dim
         self.convs = nn.Sequential(
@@ -206,13 +199,11 @@ class RTModel(nn.Module):
             DilatedBlock(128, 128, kernel_size=3, dilation=16),
         )
 
-        # Unified-termini models carry termini only in the token sequence, so
-        # the head sees just pooled conv channels + the 5 global features.
-        head_in = (128 + 3 + 1 + 1) if unified_termini \
-            else (128 + 4 + 4 + 4 + 4 + 3 + 1 + 1)   # 133 / 149
+        # Termini live in the token sequence, so the head sees just pooled
+        # conv channels + the 5 global features.
         self.head = nn.Sequential(
             nn.Dropout(0.3),
-            nn.Linear(head_in, 128),
+            nn.Linear(128 + 5, 128),
             nn.GELU(),
             nn.Dropout(0.2),
             nn.Linear(128, 1),
@@ -240,105 +231,39 @@ class RTModel(nn.Module):
     # ---- runtime extension ----
 
     def extend_vocab(
-        self,
-        new_main_tokens: Iterable[tuple[str, Optional[str], bool]] = (),
-        new_nterm_mods: Iterable[str] = (),
-        new_cterm_mods: Iterable[str] = (),
+        self, new_tokens: Iterable[tuple[str, Optional[str], bool]],
     ) -> None:
         """Grow the vocab + every dependent embedding table / lookup buffer
         in-place. After calling this, any optimizer holding references to the
         old embedding parameters MUST be rebuilt.
 
-        new_main_tokens: iterable of (token, parent_aa | None, fresh: bool).
-        Parent's row is copied for the new main / n-term / c-term embedding
-        rows; physico and global lookup rows are recomputed from vocab lineage.
+        new_tokens: iterable of (token, parent_aa | None, fresh: bool). The
+        parent's embedding row is copied for each new row (zero when there is
+        no parent or the token is fresh); physico and global lookup rows are
+        recomputed from vocab lineage.
         """
-        new_main = list(new_main_tokens)
-        new_nterm = list(new_nterm_mods)
-        new_cterm = list(new_cterm_mods)
-        if not new_main and not new_nterm and not new_cterm:
+        new = list(new_tokens)
+        if not new:
             return
-
         device = self.embedding.weight.device
-
-        # Precompute init rows for main / terminal embeddings using the OLD vocab.
-        if (new_nterm or new_cterm) and self.unified_termini:
-            raise ValueError(
-                "unified-termini model: terminal mods are main-vocab tokens; "
-                "pass them via new_main_tokens"
-            )
-
-        if new_main:
-            n_new = len(new_main)
-            main_init = torch.zeros(n_new, self.embedding.embedding_dim, device=device)
-            if not self.unified_termini:
-                nterm_aa_init = torch.zeros(n_new, self.n_term_embedding.embedding_dim, device=device)
-                cterm_aa_init = torch.zeros(n_new, self.c_term_embedding.embedding_dim, device=device)
-            for k, (_, parent_aa, fresh) in enumerate(new_main):
-                if parent_aa is None or fresh:
-                    continue
-                pid = self.vocab.tokens.get(parent_aa)
-                if pid is None:
-                    continue
-                main_init[k] = self.embedding.weight.data[pid].clone()
-                if not self.unified_termini:
-                    nterm_aa_init[k] = self.n_term_embedding.weight.data[pid].clone()
-                    cterm_aa_init[k] = self.c_term_embedding.weight.data[pid].clone()
-
-            for token, parent_aa, fresh in new_main:
-                self.vocab.extend(token, parent_aa, fresh)
-
-            self.embedding = _resize_embedding(self.embedding, self.vocab.size, main_init, padding_idx=0)
-            if not self.unified_termini:
-                self.n_term_embedding = _resize_embedding(self.n_term_embedding, self.vocab.size, nterm_aa_init, padding_idx=0)
-                self.c_term_embedding = _resize_embedding(self.c_term_embedding, self.vocab.size, cterm_aa_init, padding_idx=0)
-            self._refresh_lookup_buffers()
-
-        if new_nterm:
-            init = torch.zeros(len(new_nterm), self.nterm_mod_embedding.embedding_dim, device=device)
-            for mod in new_nterm:
-                self.vocab.extend_nterm_mod(mod)
-            self.nterm_mod_embedding = _resize_embedding(
-                self.nterm_mod_embedding, self.vocab.nterm_size, init,
-            )
-
-        if new_cterm:
-            init = torch.zeros(len(new_cterm), self.cterm_mod_embedding.embedding_dim, device=device)
-            for mod in new_cterm:
-                self.vocab.extend_cterm_mod(mod)
-            self.cterm_mod_embedding = _resize_embedding(
-                self.cterm_mod_embedding, self.vocab.cterm_size, init,
-            )
+        init = torch.zeros(len(new), self.embedding.embedding_dim, device=device)
+        for k, (_, parent_aa, fresh) in enumerate(new):
+            if parent_aa is None or fresh:
+                continue
+            pid = self.vocab.tokens.get(parent_aa)
+            if pid is not None:
+                init[k] = self.embedding.weight.data[pid].clone()
+        for token, parent_aa, fresh in new:
+            self.vocab.extend(token, parent_aa, fresh)
+        self.embedding = _resize_embedding(self.embedding, self.vocab.size, init, padding_idx=0)
+        self._refresh_lookup_buffers()
 
     # ---- forward ----
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        nterm_mod_id: Optional[torch.Tensor] = None,
-        cterm_mod_id: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        B = x.size(0)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         tokens = x
         mask = (x != 0).unsqueeze(1)
         token_mask = (tokens != 0).float()
-
-        if self.unified_termini:
-            n_term_emb = c_term_emb = n_mod = c_mod = None
-        else:
-            n_term_token = tokens[:, 0]
-            lengths = (x != 0).sum(dim=1)
-            c_term_idx = (lengths - 1).clamp(min=0)
-            c_term_tokens = x.gather(1, c_term_idx.unsqueeze(1)).squeeze(1)
-            n_term_emb = self.n_term_embedding(n_term_token)
-            c_term_emb = self.c_term_embedding(c_term_tokens)
-
-            if nterm_mod_id is None:
-                nterm_mod_id = torch.zeros(B, dtype=torch.long, device=tokens.device)
-            if cterm_mod_id is None:
-                cterm_mod_id = torch.zeros(B, dtype=torch.long, device=tokens.device)
-            n_mod = self.nterm_mod_embedding(nterm_mod_id)
-            c_mod = self.cterm_mod_embedding(cterm_mod_id)
 
         phys = self.physico_features[x]
         emb = self.embedding(x)
@@ -353,38 +278,8 @@ class RTModel(nn.Module):
         frac_hydrophobic = (self.hydrophobic_table[tokens] * token_mask).sum(dim=1, keepdim=True) / seq_lengths
         norm_seq_len = seq_lengths / float(MAX_LEN)
 
-        if self.unified_termini:
-            feats = torch.cat([
-                z, gravy, net_charge, frac_aromatic,
-                norm_seq_len, frac_hydrophobic,
-            ], dim=1)
-        else:
-            feats = torch.cat([
-                z, n_term_emb, c_term_emb, n_mod, c_mod,
-                gravy, net_charge, frac_aromatic,
-                norm_seq_len, frac_hydrophobic,
-            ], dim=1)
+        feats = torch.cat([
+            z, gravy, net_charge, frac_aromatic,
+            norm_seq_len, frac_hydrophobic,
+        ], dim=1)
         return self.head(feats).squeeze(1)
-
-
-def load_legacy_state_dict(model: RTModel, state_dict: dict) -> None:
-    """Load a pre-format-version checkpoint into a fresh RTModel built with
-    Vocabulary.default(). Legacy checkpoints have an over-sized
-    nterm_mod_embedding / cterm_mod_embedding (capacity 8 rather than the
-    actual 2 / 1 used). Slice their weights to fit; load everything else as-is.
-    """
-    target = model.state_dict()
-    new_state: dict[str, torch.Tensor] = {}
-    for key, val in state_dict.items():
-        if key not in target:
-            continue
-        tshape = target[key].shape
-        if val.shape == tshape:
-            new_state[key] = val
-        elif val.dim() == target[key].dim() and all(v >= t for v, t in zip(val.shape, tshape)):
-            slices = tuple(slice(0, s) for s in tshape)
-            new_state[key] = val[slices].contiguous()
-        else:
-            # incompatible — keep model's init
-            new_state[key] = target[key]
-    model.load_state_dict(new_state, strict=False)

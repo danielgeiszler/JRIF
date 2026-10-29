@@ -5,6 +5,7 @@ Public API:
 """
 
 from jrif.api import RTPredictor
+from jrif.dataset import TokenizationError
 from jrif.im import IMPredictor
 
-__all__ = ["RTPredictor", "IMPredictor"]
+__all__ = ["RTPredictor", "IMPredictor", "TokenizationError"]

@@ -2,9 +2,9 @@
 
 `RTPredictor` is the single user-facing entrypoint. Build one of three ways:
 
-  1. `RTPredictor.from_blank()`  — fresh model with the default 24-token vocab.
+  1. `RTPredictor.from_blank()`  — fresh model with the default vocab.
   2. `RTPredictor.from_checkpoint(path)` — reload a previously-trained model
-     (self-describing checkpoint OR a legacy pre-format_version `.pt` file).
+     (self-describing checkpoint: weights + vocab + RT scale + warp).
   3. After `fit`, the same instance carries a trained model with vocab and
      RT scale already wired up, ready for `.predict(df)` and `.save(path)`.
 
@@ -41,21 +41,35 @@ from jrif.dataset import (
     Vocabulary,
     discover_tokens,
     fit_rt_scale,
+    strict_filter,
     to_polars,
 )
 from jrif.loss import LaplaceUniformMixture, NormalNormalMixture
-from jrif.model import RTModel, load_legacy_state_dict
+from jrif.model import RTModel
 from jrif.muon import Muon
 
 
-CHECKPOINT_FORMAT_VERSION = 1
+# 3: terminus tokens (<nterm>/<cterm>) in every tokenized peptide. Earlier
+# formats used a different input representation and cannot be loaded.
+CHECKPOINT_FORMAT_VERSION = 3
 
 
-# Architecture registry: name -> (build_fn(vocab, embedding_dim), arch_label).
+def _load_checkpoint_dict(path: Path, kind: str) -> dict:
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    version = ckpt.get("format_version") if isinstance(ckpt, dict) else None
+    if version != CHECKPOINT_FORMAT_VERSION:
+        raise ValueError(
+            f"{path}: checkpoint format {version!r} is not supported (expected "
+            f"{CHECKPOINT_FORMAT_VERSION}); retrain the model with this version of jrif")
+    if ckpt.get("kind", "rt") != kind:
+        raise ValueError(f"{path} is not an {kind.upper()} checkpoint")
+    return ckpt
+
+
+# Architecture registry: name -> build_fn(vocab, embedding_dim).
 # Only architectures listed here can be saved to / loaded from a checkpoint.
-def _build_dilated_cnn(vocab: Vocabulary, embedding_dim: int,
-                       unified_termini: bool = False) -> nn.Module:
-    return RTModel(vocab, embedding_dim=embedding_dim, unified_termini=unified_termini)
+def _build_dilated_cnn(vocab: Vocabulary, embedding_dim: int) -> nn.Module:
+    return RTModel(vocab, embedding_dim=embedding_dim)
 
 
 _ARCH_BUILDERS = {
@@ -150,10 +164,9 @@ def _eval_metrics(
     total_loss = 0.0
     preds_all, tgts_all = [], []
     with torch.no_grad():
-        for seqs, nterm, cterm, targets in loader:
-            seqs = seqs.to(device); nterm = nterm.to(device)
-            cterm = cterm.to(device); targets = targets.to(device)
-            preds = model(seqs, nterm, cterm)
+        for seqs, targets in loader:
+            seqs = seqs.to(device); targets = targets.to(device)
+            preds = model(seqs)
             total_loss += criterion(preds, targets).item() * len(targets)
             preds_all.append(preds.cpu()); tgts_all.append(targets.cpu())
     preds = torch.cat(preds_all); tgts = torch.cat(tgts_all)
@@ -196,58 +209,35 @@ class RTPredictor:
     @classmethod
     def from_blank(
         cls, *, embedding_dim: int = 16, arch: str = DEFAULT_ARCH,
-        unified_termini: bool = False,
     ) -> "RTPredictor":
-        """unified_termini: terminal mods are main-vocab tokens in the
-        sequence (format_version-2 checkpoints); no terminal head features."""
         if arch not in _ARCH_BUILDERS:
             raise ValueError(f"Unknown arch {arch!r}. Available: {sorted(_ARCH_BUILDERS)}")
-        model = _ARCH_BUILDERS[arch](Vocabulary.default(), embedding_dim, unified_termini)
+        model = _ARCH_BUILDERS[arch](Vocabulary.default(), embedding_dim)
         return cls(model=model, arch=arch)
 
     @classmethod
     def from_checkpoint(
         cls, path: Union[str, Path], *, device: Optional[str] = None,
     ) -> "RTPredictor":
-        path = Path(path)
-        try:
-            ckpt = torch.load(path, map_location="cpu", weights_only=True)
-        except Exception:
-            # legacy pre-format_version checkpoints may contain pickled objects
-            ckpt = torch.load(path, map_location="cpu", weights_only=False)
-        if isinstance(ckpt, dict) and ckpt.get("format_version") in (1, 2):
-            vocab = Vocabulary.from_dict(ckpt["vocab"])
-            embedding_dim = int(ckpt.get("embedding_dim", 16))
-            # Default to dilated_cnn for v1 checkpoints written before arch was
-            # tracked, so older saved files still load without a key error.
-            arch = ckpt.get("arch", "dilated_cnn")
-            if arch not in _ARCH_BUILDERS:
-                raise ValueError(f"Checkpoint arch {arch!r} not supported. "
-                                 f"Available: {sorted(_ARCH_BUILDERS)}")
-            unified = bool(ckpt.get("unified_termini", False))
-            model = _ARCH_BUILDERS[arch](vocab, embedding_dim, unified)
-            model.load_state_dict(ckpt["model_state_dict"])
-            predictor = cls(
-                model=model,
-                rt_median=float(ckpt.get("rt_median", 0.0)),
-                rt_mad=float(ckpt.get("rt_mad", 1.0)),
-                trained_on=ckpt.get("trained_on"),
-                arch=arch,
-            )
-            warp = ckpt.get("rt_warp")
-            if warp is not None:
-                predictor.rt_warp = (np.asarray(warp[0], dtype=float),
-                                     np.asarray(warp[1], dtype=float))
-        else:
-            # Legacy checkpoint: build a default-vocab dilated CNN and slice
-            # oversized mod embeddings down to fit.
-            model = RTModel(Vocabulary.default(), embedding_dim=16)
-            state = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
-            load_legacy_state_dict(model, state)
-            rt_med = float(ckpt.get("rt_median", 0.0)) if isinstance(ckpt, dict) else 0.0
-            rt_mad = float(ckpt.get("rt_mad", 1.0)) if isinstance(ckpt, dict) else 1.0
-            predictor = cls(model=model, rt_median=rt_med, rt_mad=rt_mad,
-                            trained_on="legacy", arch="dilated_cnn")
+        ckpt = _load_checkpoint_dict(Path(path), "rt")
+        arch = ckpt["arch"]
+        if arch not in _ARCH_BUILDERS:
+            raise ValueError(f"Checkpoint arch {arch!r} not supported. "
+                             f"Available: {sorted(_ARCH_BUILDERS)}")
+        model = _ARCH_BUILDERS[arch](Vocabulary.from_dict(ckpt["vocab"]),
+                                     int(ckpt["embedding_dim"]))
+        model.load_state_dict(ckpt["model_state_dict"])
+        predictor = cls(
+            model=model,
+            rt_median=float(ckpt["rt_median"]),
+            rt_mad=float(ckpt["rt_mad"]),
+            trained_on=ckpt.get("trained_on"),
+            arch=arch,
+        )
+        warp = ckpt.get("rt_warp")
+        if warp is not None:
+            predictor.rt_warp = (np.asarray(warp[0], dtype=float),
+                                 np.asarray(warp[1], dtype=float))
         if device is not None:
             predictor.model.to(device)
         return predictor
@@ -257,10 +247,9 @@ class RTPredictor:
     def save(self, path: Union[str, Path]) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        unified = bool(getattr(self.model, "unified_termini", False))
         torch.save({
-            "format_version": 2 if unified else CHECKPOINT_FORMAT_VERSION,
-            "unified_termini": unified,
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "kind": "rt",
             "arch": self.arch,
             "model_state_dict": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             "vocab": self.vocab.to_dict(),
@@ -281,6 +270,7 @@ class RTPredictor:
         seq_col: str = "seq",
         batch_size: int = 2048,
         device: Optional[str] = None,
+        strict: bool = True,
     ) -> np.ndarray:
         device_t = torch.device(
             device if device else _auto_device()
@@ -295,14 +285,14 @@ class RTPredictor:
             df_with_rt, self.vocab,
             seq_col=seq_col, rt_col="__rt__",
             rt_median=self.rt_median, rt_mad=self.rt_mad,
-            terminal_in_seq=bool(getattr(self.model, "unified_termini", False)),
+            strict=strict,
         )
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
         preds_z: list[torch.Tensor] = []
         with torch.inference_mode():
-            for seqs, nterm, cterm, _ in loader:
-                z = self.model(seqs.to(device_t), nterm.to(device_t), cterm.to(device_t)).cpu()
+            for seqs, _ in loader:
+                z = self.model(seqs.to(device_t)).cpu()
                 preds_z.append(z)
         z = torch.cat(preds_z) if preds_z else torch.empty(0)
         out = (z * self.rt_mad + self.rt_median).numpy()
@@ -369,6 +359,10 @@ class RTPredictor:
               .filter(pl.col("seq").str.len_chars() > 0)
               .unique(subset=["seq"])
         )
+        df_pl, n_bad, first = strict_filter(df_pl, self.vocab, will_extend=True)
+        if n_bad:
+            print(f"jrif: skipped {n_bad} ID(s) that could not be tokenized "
+                  f"(first: {first})", flush=True)
         n = len(df_pl)
         rng = random.Random(seed)
         order = list(range(n)); rng.shuffle(order)
@@ -377,7 +371,9 @@ class RTPredictor:
         y_hold = hold["rt"].to_numpy()
 
         self.rt_warp = None
-        z_hold = self.predict(hold, seq_col="seq", device=device)
+        # strict=False: novel mods aren't in the vocab yet (fit extends it);
+        # the rank check wants the bare-residue fallback here.
+        z_hold = self.predict(hold, seq_col="seq", device=device, strict=False)
         rank = float(spearmanr(y_hold, z_hold).statistic)
         report = {"n": n, "holdout_rank": rank}
 
@@ -391,7 +387,7 @@ class RTPredictor:
             fit_kwargs.setdefault("verbose", verbose)
             self.fit(df_pl, seq_col="seq", rt_col="rt", val_df=hold,
                      device=device, seed=seed, **{**SHIPPING_RECIPE, **fit_kwargs})
-            pred = self.predict(hold, seq_col="seq", device=device)
+            pred = self.predict(hold, seq_col="seq", device=device, strict=False)
             report["holdout_mae"] = float(np.abs(pred - y_hold).mean())
             report["mode"] = "finetune_raw"
             return report
@@ -403,7 +399,7 @@ class RTPredictor:
             return xk, yk
 
         # 1. warp from calibration split; score warp-only on holdout
-        z_cal = self.predict(cal, seq_col="seq", device=device)
+        z_cal = self.predict(cal, seq_col="seq", device=device, strict=False)
         xk, yk = fit_warp(z_cal, cal["rt"].to_numpy())
         warp_hold_mae = float(np.abs(np.interp(z_hold, xk, yk) - y_hold).mean())
 
@@ -420,23 +416,23 @@ class RTPredictor:
                  seq_col="seq", rt_col="rt", val_df=hold_inv,
                  device=device, seed=seed, **{**SHIPPING_RECIPE, **fit_kwargs})
         # refit warp on the fine-tuned model's own outputs
-        z_cal2 = self.predict(cal, seq_col="seq", device=device)
+        z_cal2 = self.predict(cal, seq_col="seq", device=device, strict=False)
         xk2, yk2 = fit_warp(z_cal2, cal["rt"].to_numpy())
-        z_hold2 = self.predict(hold, seq_col="seq", device=device)
+        z_hold2 = self.predict(hold, seq_col="seq", device=device, strict=False)
         ft_hold_mae = float(np.abs(np.interp(z_hold2, xk2, yk2) - y_hold).mean())
 
         report["warp_only_holdout_mae"] = warp_hold_mae
         report["warp_finetune_holdout_mae"] = ft_hold_mae
         if ft_hold_mae <= warp_hold_mae:
             # keep fine-tuned weights; final warp refit on ALL ids
-            z_all = self.predict(df_pl, seq_col="seq", device=device)
+            z_all = self.predict(df_pl, seq_col="seq", device=device, strict=False)
             self.rt_warp = fit_warp(z_all, df_pl["rt"].to_numpy())
             report["mode"] = "warp+finetune"
             report["holdout_mae"] = ft_hold_mae
         else:
             # training hurt (tiny N): restore base weights, warp-only on ALL ids
             self.model.load_state_dict(base_state)
-            z_all = self.predict(df_pl, seq_col="seq", device=device)
+            z_all = self.predict(df_pl, seq_col="seq", device=device, strict=False)
             self.rt_warp = fit_warp(z_all, df_pl["rt"].to_numpy())
             report["mode"] = "warp"
             report["holdout_mae"] = warp_hold_mae
@@ -461,10 +457,7 @@ class RTPredictor:
               .filter(pl.col("seq").str.len_chars() > 0)
               .unique(subset=["seq"])
         )
-        unified = bool(getattr(self.model, "unified_termini", False))
-        new_main, new_nterm = discover_tokens(
-            df_pl["seq"].to_list(), self.vocab, terminal_in_seq=unified)
-        novel = set(new_main) | set(new_nterm)
+        novel = set(discover_tokens(df_pl["seq"].to_list(), self.vocab))
         if novel:
             def has_novel(seq: str) -> bool:
                 return any(t in seq for t in novel)
@@ -501,7 +494,7 @@ class RTPredictor:
         self.fit(df_pl.with_columns(pl.Series("rt", inv_targets)),
                  seq_col="seq", rt_col="rt", device=device, seed=seed,
                  **{**SHIPPING_RECIPE, **fit_kwargs})
-        z_all = self.predict(df_pl, seq_col="seq", device=device)
+        z_all = self.predict(df_pl, seq_col="seq", device=device, strict=False)
         iso = IsotonicRegression(out_of_bounds="clip").fit(z_all, df_pl["rt"].to_numpy())
         self.rt_warp = (np.asarray(iso.X_thresholds_, float),
                         np.asarray(iso.y_thresholds_, float))
@@ -532,7 +525,6 @@ class RTPredictor:
         seed: int = 42,
         device: Optional[str] = None,
         num_threads: Optional[int] = None,
-        log_dir: Optional[str] = None,
         patience: Optional[int] = None,
         trained_on: Optional[str] = None,
         verbose: bool = True,
@@ -609,28 +601,25 @@ class RTPredictor:
             train_pl = df_pl
         else:
             train_pl, val_pl = _split_train_val(df_pl, val_fraction=val_fraction, seed=seed)
+
+        train_pl, n_bad_tr, first = strict_filter(train_pl, self.vocab, will_extend=True)
+        val_pl, n_bad_va, first_va = strict_filter(val_pl, self.vocab, will_extend=True)
+        if n_bad_tr + n_bad_va:
+            print(f"jrif: skipped {n_bad_tr + n_bad_va} ID(s) that could not "
+                  f"be tokenized (first: {first or first_va})", flush=True)
         if verbose:
             print(f"Train: {len(train_pl)}, Val: {len(val_pl)}", flush=True)
 
         # 2. Discover unknown tokens against current vocab and extend the model
-        unified = bool(getattr(self.model, "unified_termini", False))
         all_seqs = pl.concat([train_pl, val_pl])["seq"].to_list()
-        new_main, new_nterm = discover_tokens(all_seqs, self.vocab, terminal_in_seq=unified)
         fresh_set = set(fresh_mods)
-        new_main_triples = [
-            (token, parent, token in fresh_set) for token, parent in new_main.items()
-        ]
-        if new_main_triples or new_nterm:
+        new_tokens = [(token, parent, token in fresh_set)
+                      for token, parent in discover_tokens(all_seqs, self.vocab).items()]
+        if new_tokens:
             if verbose:
-                if new_main_triples:
-                    print(f"  Discovered {len(new_main_triples)} new main token(s): "
-                          f"{[t for t,_,_ in new_main_triples]}")
-                if new_nterm:
-                    print(f"  Discovered {len(new_nterm)} new N-term mod(s): {sorted(new_nterm)}")
-            self.model.extend_vocab(
-                new_main_tokens=new_main_triples,
-                new_nterm_mods=sorted(new_nterm),
-            )
+                print(f"  Discovered {len(new_tokens)} new token(s): "
+                      f"{[t for t, _, _ in new_tokens]}")
+            self.model.extend_vocab(new_tokens)
 
         # 3. Fit RT scale on TRAIN only; build datasets
         train_rts = train_pl["rt"].to_numpy().astype("float32")
@@ -639,9 +628,9 @@ class RTPredictor:
             print(f"  RT scale: median={rt_med:.3f}, MAD={rt_mad:.3f}", flush=True)
 
         train_ds = RTDataset(train_pl, self.vocab, seq_col="seq", rt_col="rt",
-                             rt_median=rt_med, rt_mad=rt_mad, terminal_in_seq=unified)
+                             rt_median=rt_med, rt_mad=rt_mad)
         val_ds = RTDataset(val_pl, self.vocab, seq_col="seq", rt_col="rt",
-                           rt_median=rt_med, rt_mad=rt_mad, terminal_in_seq=unified)
+                           rt_median=rt_med, rt_mad=rt_mad)
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, shuffle=True,
             generator=torch.Generator().manual_seed(seed),
@@ -687,12 +676,6 @@ class RTPredictor:
         if selection_metric not in ("mae", "r2"):
             raise ValueError(f"Unknown selection_metric {selection_metric!r}; expected mae or r2")
 
-        # Optional TB logging
-        writer = None
-        if log_dir is not None:
-            from torch.utils.tensorboard import SummaryWriter
-            writer = SummaryWriter(log_dir=log_dir)
-
         # 5. Train
         best_val_r2 = -float("inf")
         best_val_mae = float("inf")
@@ -711,10 +694,9 @@ class RTPredictor:
 
             self.model.train()
             running_loss = 0.0; n = 0
-            for seqs, nterm, cterm, targets in train_loader:
-                seqs = seqs.to(device_t); nterm = nterm.to(device_t)
-                cterm = cterm.to(device_t); targets = targets.to(device_t)
-                preds = self.model(seqs, nterm, cterm)
+            for seqs, targets in train_loader:
+                seqs = seqs.to(device_t); targets = targets.to(device_t)
+                preds = self.model(seqs)
                 loss = criterion(preds, targets)
                 for o in opts: o.zero_grad()
                 loss.backward()
@@ -735,13 +717,6 @@ class RTPredictor:
                 "val_loss": val_loss, "val_mae": val_mae,
                 "val_r2": val_r2, "val_d95": val_d95, "lr": current_lr,
             })
-            if writer is not None:
-                writer.add_scalar("Loss/train", train_loss, epoch)
-                writer.add_scalar("Loss/val", val_loss, epoch)
-                writer.add_scalar("Metrics/val_MAE", val_mae, epoch)
-                writer.add_scalar("Metrics/val_R2", val_r2, epoch)
-                writer.add_scalar("Metrics/val_d95", val_d95, epoch)
-                writer.add_scalar("LR", current_lr, epoch)
             if verbose:
                 print(
                     f"Epoch {epoch+1:3d}/{epochs} | train_loss {train_loss:.4f} | "
@@ -768,9 +743,6 @@ class RTPredictor:
                               f"(no val_{selection_metric.upper()} improvement for {patience} epochs)",
                               flush=True)
                     break
-
-        if writer is not None:
-            writer.close()
 
         # 6. Restore best, persist scale + provenance
         if best_state is not None:

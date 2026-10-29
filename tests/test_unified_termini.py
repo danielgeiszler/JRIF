@@ -1,99 +1,59 @@
-"""Unified-termini mode: terminal mods live only in the token sequence.
-
-Validated by bench_termmods_pooling.py (inseq_clean ties the stock model on
-the apex PSMtag library, 3 seeds). These tests pin the mechanics: tokenizer
-placement, head sizing, discovery routing, checkpoint round-trip, and the
-no-perturbation guarantee on vocab extension.
-"""
+"""Termini live only in the token sequence: model mechanics, checkpoint
+round-trip, and calibrate() behavior (warp-first, fallback, curriculum)."""
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 
-from jrif.api import RTPredictor
-from jrif.dataset import RTDataset, Vocabulary, discover_tokens, tokenize
+from jrif.api import CHECKPOINT_FORMAT_VERSION, RTPredictor
+from jrif.dataset import Vocabulary, tokenize
 from jrif.model import RTModel
 
 
-def _unified_vocab():
+def _psmtag_vocab():
     v = Vocabulary.default()
     v.extend(".[308]", None, fresh=True)
     return v
 
 
-def test_tokenize_terminal_in_seq_places_nterm_token_first():
-    v = _unified_vocab()
-    ids, nterm, cterm = tokenize(".[308]ACK[308]R", v, terminal_in_seq=True)
-    assert ids[0] == v.tokens[".[308]"]
-    assert ids[1] == v.tokens["A"]
-    assert ids[3] == v.tokens["K[308]"]
-    assert nterm == 0 and cterm == 0
-    # default mode unchanged: mod goes to the separate channel
-    ids2, nterm2, _ = tokenize(".[308]ACK[308]R", v)
-    assert ids2[0] == v.tokens["A"]
-    assert nterm2 == v.nterm_mod_tokens[".[308]"]
-
-
-def test_discover_routes_nterm_mods_to_main_when_unified():
-    v = Vocabulary.default()
-    new_main, new_nterm = discover_tokens([".[999]ACK"], v, terminal_in_seq=True)
-    assert ".[999]" in new_main and new_main[".[999]"] is None
-    assert not new_nterm
-    new_main2, new_nterm2 = discover_tokens([".[999]ACK"], v)
-    assert ".[999]" in new_nterm2 and ".[999]" not in new_main2
-
-
-def test_unified_model_has_no_terminal_embeddings_and_small_head():
-    m = RTModel(_unified_vocab(), unified_termini=True)
-    assert not hasattr(m, "n_term_embedding")
-    assert not hasattr(m, "nterm_mod_embedding")
+def test_model_head_sees_only_pooled_conv_and_globals():
+    m = RTModel(Vocabulary.default())
     assert m.head[1].in_features == 133
-    legacy = RTModel(Vocabulary.default())
-    assert legacy.head[1].in_features == 149
+    assert {n.split(".")[0] for n, _ in m.named_parameters()} == {"embedding", "convs", "head"}
 
 
-def test_unified_extend_vocab_rejects_terminal_mod_channels():
-    m = RTModel(_unified_vocab(), unified_termini=True)
-    with pytest.raises(ValueError):
-        m.extend_vocab(new_nterm_mods=[".[999]"])
-
-
-def test_unified_extend_vocab_does_not_perturb_existing_predictions():
-    m = RTModel(_unified_vocab(), unified_termini=True)
+def test_extend_vocab_does_not_perturb_existing_predictions():
+    m = RTModel(_psmtag_vocab())
     m.eval()
-    v = m.vocab
-    x = torch.tensor([[v.tokens[".[308]"], v.tokens["A"], v.tokens["C[160]"],
-                       v.tokens["K[308]"]] + [0] * 46])
+    x = torch.tensor([tokenize(".[308]ACK[308]", m.vocab)])
     with torch.no_grad():
         before = m(x).clone()
-    m.extend_vocab(new_main_tokens=[("S[80]", "S", False), (".[999]", None, True)])
+    m.extend_vocab([("S[80]", "S", False), (".[999]", None, True)])
     m.eval()
     with torch.no_grad():
         after = m(x)
     assert torch.allclose(before, after, atol=1e-6)
 
 
-def test_unified_fit_predict_checkpoint_roundtrip(tmp_path):
+def test_fit_predict_checkpoint_roundtrip(tmp_path):
     rng = np.random.default_rng(0)
     seqs = [".[308]" + "".join(rng.choice(list("ACDEFGHIKLMNPQRSTVWY"), 8)) + "K[308]"
             for _ in range(200)]
     df = pd.DataFrame({"seq": seqs, "rt": rng.normal(50, 10, 200)})
 
-    p = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    p = RTPredictor.from_blank()
     p.fit(df, epochs=2, device="cpu", verbose=False)
     preds = p.predict(df, device="cpu")
     assert preds.shape == (200,)
-    # .[308] was discovered as a MAIN token, not an nterm mod
-    assert ".[308]" in p.vocab.tokens
+    assert ".[308]" in p.vocab.tokens  # discovered and learned
 
-    path = tmp_path / "unified.pt"
+    path = tmp_path / "rt.pt"
     p.save(path)
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    assert ckpt["format_version"] == 2 and ckpt["unified_termini"] is True
+    ckpt = torch.load(path, map_location="cpu", weights_only=True)
+    assert ckpt["format_version"] == CHECKPOINT_FORMAT_VERSION
 
     q = RTPredictor.from_checkpoint(path)
-    assert q.model.unified_termini
     preds2 = q.predict(df, device="cpu")
     assert np.allclose(preds, preds2, atol=1e-5)
 
@@ -106,7 +66,7 @@ def test_calibrate_isotonic_and_roundtrip(tmp_path):
     seqs = ["".join(rng.choice(aas, rng.integers(7, 20))) for _ in range(400)]
     df = pd.DataFrame({"seq": seqs,
                        "rt": [50 + sum(w[a] for a in s) for s in seqs]})
-    p = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    p = RTPredictor.from_blank()
     p.fit(df, epochs=60, lr=1e-3, device="cpu", verbose=False)
     # new experiment: nonlinear monotone warp of the same chemistry
     warped = df.assign(rt=np.exp(df["rt"] / 25.0).clip(upper=1e6))
@@ -128,7 +88,7 @@ def test_calibrate_falls_back_to_finetune_on_broken_rank():
     aas = list("ACDEFGHIKLMNPQRSTVWY")
     seqs = ["".join(rng.choice(aas, rng.integers(7, 20))) for _ in range(200)]
     df = pd.DataFrame({"seq": seqs, "rt": rng.normal(0, 1, 200)})  # random targets
-    p = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    p = RTPredictor.from_blank()
     rep = p.calibrate(df, device="cpu", verbose=False, epochs=2)
     assert rep["mode"] == "finetune_raw"
     assert p.rt_warp is None
@@ -141,7 +101,7 @@ def test_calibrate_curriculum_with_novel_tokens(tmp_path):
     seqs = ["".join(rng.choice(aas, rng.integers(7, 20))) for _ in range(400)]
     df = pd.DataFrame({"seq": seqs,
                        "rt": [50 + sum(w[a] for a in s) for s in seqs]})
-    p = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    p = RTPredictor.from_blank()
     p.fit(df, epochs=60, lr=1e-3, device="cpu", verbose=False)
     # new experiment: warped scale, and a novel mod on ~25% of peptides
     new = df.assign(rt=np.exp(df["rt"] / 25.0).clip(upper=1e6))
@@ -159,6 +119,6 @@ def test_calibrate_curriculum_no_novel_tokens_falls_through():
     aas = list("ACDEFGHIKLMNPQRSTVWY")
     seqs = ["".join(rng.choice(aas, rng.integers(7, 20))) for _ in range(150)]
     df = pd.DataFrame({"seq": seqs, "rt": rng.normal(0, 1, 150)})
-    p = RTPredictor.from_blank(arch="dilated_cnn", unified_termini=True)
+    p = RTPredictor.from_blank()
     rep = p.calibrate(df, device="cpu", verbose=False, curriculum=True, epochs=2)
     assert rep["mode"] == "finetune_raw"   # unrankable -> single-phase fallback
